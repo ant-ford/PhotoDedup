@@ -1,21 +1,36 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-v2.2 - Safely deduplicates Google Photos Takeout media exports using SHA-256 content hashing.
+v2.3 - Safely deduplicates Google Photos Takeout media exports using SHA-256 content hashing.
 
 .DESCRIPTION
 Duplicate identity = same byte size + same SHA-256 content hash. File names are NEVER
 used to identify duplicates.
 
-A copy with a sibling <name>.supplemental-metadata.json is ALWAYS preferred: when any
-copy in a duplicate group has metadata, only metadata-bearing copies are eligible to be
-the keeper.
+Keeper eligibility, applied in order:
+    1. Copies outside Google Photos Trash/Bin folders beat copies inside them, so a
+       keeper is never one that is due to be cleared out with the Trash.
+    2. A copy with supplemental metadata is ALWAYS preferred: when any eligible copy
+       has metadata, only metadata-bearing copies can be the keeper.
+
+Supplemental metadata is found by name, then by location:
+    Names     <name.ext>.supplemental-metadata.json
+              <name>(N).ext  ->  <name.ext>.supplemental-metadata(N).json
+              <name>-edited.ext  ->  the original's sidecar (shared, never moved)
+    Location  SameFolder - next to the media file.
+              OtherPart  - at the same Takeout-relative path in a different export
+                           folder (normal for split Takeout zips), e.g.
+                           Imports\<partA>\Takeout\Google Photos\X.jpg  with
+                           Imports\<partB>\Takeout\Google Photos\X.jpg.supplemental-metadata.json
 
 Modes:
     Report     (default) - CSV report only; nothing under SourceRoot is modified.
 
-    Quarantine - moves losing copies AND their companion metadata JSON as a pair to
-                 QuarantineRoot, preserving the original relative folder structure.
+    Quarantine - moves losing media copies to QuarantineRoot, preserving the original
+                 relative folder structure. Metadata JSON is LEFT IN PLACE by default
+                 (it may describe albums, descriptions or people that the keeper's own
+                 JSON lacks). -MoveMetadataWithMedia restores the v2.2 behaviour of
+                 moving a loser's same-folder sidecar together with it as a pair.
 
                  Every file is re-verified immediately before its move:
                  exists + size + SHA-256. Any mismatch becomes ReviewRequired and the
@@ -90,6 +105,15 @@ Must not overlap SourceRoot.
 Extensions treated as media.
 Default: .jpg .jpeg .heic .png .mp4 .mov .avi
 
+.PARAMETER MoveMetadataWithMedia
+Quarantine only. Also moves each losing copy's own same-folder sidecar JSON with it, as
+a verified pair (v2.2 behaviour). Off by default: JSON stays where it is.
+
+.PARAMETER TrashFolderNames
+Names of Google Photos deleted-items folders (directly under "Google Photos").
+Copies inside them are never chosen as keeper while a copy exists elsewhere.
+Default: Trash, Bin
+
 .PARAMETER IAcceptPermanentDeletion
 Required for Mode Delete. Still combined with an interactive typed confirmation phrase.
 
@@ -134,13 +158,20 @@ param(
 
     [string[]]$MediaExtensions = @('.jpg', '.jpeg', '.heic', '.png', '.mp4', '.mov', '.avi'),
 
+    [switch]$MoveMetadataWithMedia,
+    [string[]]$TrashFolderNames = @('Trash', 'Bin'),
+
     [switch]$IAcceptPermanentDeletion,
     [switch]$AllowIncompleteScan
 )
 
 $ErrorActionPreference = 'Stop'
+$ScriptVersion = 'v2.3'
 $MetadataSuffix = '.supplemental-metadata.json'
+$SidecarPattern = '\.supplemental-metadata(\(\d+\))?\.json$'
 $DirectorySeparator = [System.IO.Path]::DirectorySeparatorChar
+
+$TrashPattern = '(^|\\)Google Photos\\({0})\\' -f (($TrashFolderNames | ForEach-Object { [regex]::Escape($_) }) -join '|')
 
 # Normalise media extensions once.
 $MediaExtensions = @($MediaExtensions | ForEach-Object { $_.ToLowerInvariant() })
@@ -306,6 +337,54 @@ function Test-KeeperIntact {
     return $false
 }
 
+function Get-PartRelativePath {
+    <#
+    Strips the export-part folder from a SourceRoot-relative path:
+        'partA\Takeout\Google Photos\X.jpg' -> 'Takeout\Google Photos\X.jpg'
+    Files directly in SourceRoot have no part folder and are returned unchanged.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    $cut = $RelativePath.IndexOf($DirectorySeparator)
+
+    if ($cut -lt 0) {
+        return $RelativePath
+    }
+
+    return $RelativePath.Substring($cut + 1)
+}
+
+function Get-SidecarNames {
+    <#
+    Returns the sidecar file names that can hold a media file's metadata, best first.
+    Each entry: Name, Match (Exact | Numbered | EditedOriginal), Own.
+    Own = $false means the sidecar belongs to another file (the unedited original)
+    and must never be moved together with this one.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$MediaName
+    )
+
+    $ext = [System.IO.Path]::GetExtension($MediaName)
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($MediaName)
+
+    [pscustomobject]@{ Name = $MediaName + $MetadataSuffix; Match = 'Exact'; Own = $true }
+
+    # Takeout names a second same-named file 'IMG(1).jpg' and its sidecar 'IMG.jpg.supplemental-metadata(1).json'.
+    if ($stem -match '^(.+)\((\d+)\)$') {
+        [pscustomobject]@{ Name = '{0}{1}.supplemental-metadata({2}).json' -f $Matches[1], $ext, $Matches[2]; Match = 'Numbered'; Own = $true }
+    }
+
+    # Edited copies have no sidecar of their own; the original's applies.
+    if ($stem -match '^(.+)-edited$') {
+        [pscustomobject]@{ Name = $Matches[1] + $ext + $MetadataSuffix; Match = 'EditedOriginal'; Own = $false }
+    }
+}
+
 # =============================================================================
 # VALIDATION & SETUP
 # =============================================================================
@@ -314,7 +393,9 @@ if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
     throw "SourceRoot does not exist or is not a folder: $SourceRoot"
 }
 
-$SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).ProviderPath.TrimEnd($DirectorySeparator)
+# Get-Item expands 8.3 short names (C:\Users\ABC~1) the same way enumeration does, so
+# SourceRoot-relative paths are cut at the right place.
+$SourceRoot = (Get-Item -LiteralPath $SourceRoot -Force).FullName.TrimEnd($DirectorySeparator)
 
 # Bare drive root normalization
 if ($SourceRoot -match '^[A-Za-z]:$') {
@@ -375,13 +456,16 @@ try {
     # RUN HEADER
     # =========================================================================
 
-    Write-Log '================ Google Photos Takeout Deduplication (v2.2) ================' HEADER
+    Write-Log ('================ Google Photos Takeout Deduplication ({0}) ================' -f $ScriptVersion) HEADER
     Write-Log ('Mode       : {0}' -f $Mode)
     Write-Log ('SourceRoot : {0}' -f $SourceRoot)
 
     if ($Mode -eq 'Quarantine') {
         Write-Log ('Quarantine : {0}' -f $QuarantineRoot)
+        Write-Log ('Metadata   : {0}' -f $(if ($MoveMetadataWithMedia) { 'own same-folder sidecar is moved WITH each losing copy (-MoveMetadataWithMedia)' } else { 'left in place (default)' }))
     }
+
+    Write-Log ('Trash      : copies under Google Photos\{0} never win over copies elsewhere' -f ($TrashFolderNames -join ' or '))
 
     Write-Log ('Report     : {0}' -f $ReportCsv)
     Write-Log ('Log        : {0}' -f $LogPath)
@@ -498,10 +582,20 @@ try {
     $supplementalCount = 0
     $otherCount = 0
 
+    # Sidecars by Takeout-relative path (export-part folder stripped), for cross-part lookup.
+    $rootLen = $SourceRoot.Length
+    $metadataByPartPath = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
     foreach ($f in $allFiles) {
-        if ($f.Name -like '*.supplemental-metadata.json') {
+        if ($f.Name -match $SidecarPattern) {
             [void]$metadataJsonSet.Add($f.FullName)
             $supplementalCount++
+
+            $partPath = Get-PartRelativePath -RelativePath $f.FullName.Substring($rootLen).TrimStart($DirectorySeparator)
+            if (-not $metadataByPartPath.ContainsKey($partPath)) {
+                $metadataByPartPath[$partPath] = New-Object System.Collections.Generic.List[string]
+            }
+            $metadataByPartPath[$partPath].Add($f.FullName)
         }
         elseif ($MediaExtensions -contains $f.Extension.ToLowerInvariant()) {
             $mediaFileInfos.Add($f)
@@ -519,16 +613,46 @@ try {
     }
 
     # Build media record set.
-    $rootLen = $SourceRoot.Length
-    $mediaPathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $media = New-Object System.Collections.Generic.List[object]
+    $referencedJsonSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($fi in $mediaFileInfos) {
-        [void]$mediaPathSet.Add($fi.FullName)
-
         $relPath = $fi.FullName.Substring($rootLen).TrimStart($DirectorySeparator)
-        $metaPath = $fi.FullName + $MetadataSuffix
-        $metaPresent = $metadataJsonSet.Contains($metaPath)
+        $partDir = [System.IO.Path]::GetDirectoryName((Get-PartRelativePath -RelativePath $relPath))
+
+        # Same folder first, then the same Takeout-relative path in any other export part.
+        $sameFolder = New-Object System.Collections.Generic.List[string]
+        $otherPart = New-Object System.Collections.Generic.List[string]
+        $metaMatch = ''
+        $companionPath = ''
+
+        foreach ($sc in (Get-SidecarNames -MediaName $fi.Name)) {
+            $siblingPath = [System.IO.Path]::Combine($fi.DirectoryName, $sc.Name)
+
+            if ($metadataJsonSet.Contains($siblingPath)) {
+                $sameFolder.Add($siblingPath)
+                if (-not $metaMatch) { $metaMatch = $sc.Match }
+                if ($sc.Own -and -not $companionPath) { $companionPath = $siblingPath }
+            }
+
+            $partKey = if ($partDir) { [System.IO.Path]::Combine($partDir, $sc.Name) } else { $sc.Name }
+            $found = $null
+
+            if ($metadataByPartPath.TryGetValue($partKey, [ref]$found)) {
+                foreach ($p in $found) {
+                    if (-not $sameFolder.Contains($p)) {
+                        $otherPart.Add($p)
+                        if (-not $metaMatch) { $metaMatch = $sc.Match }
+                    }
+                }
+            }
+        }
+
+        $metaPaths = @($sameFolder) + @($otherPart)
+        foreach ($p in $metaPaths) { [void]$referencedJsonSet.Add($p) }
+
+        $metaPresent = $metaPaths.Count -gt 0
+        $metaLocation = if ($sameFolder.Count -gt 0) { 'SameFolder' } elseif ($otherPart.Count -gt 0) { 'OtherPart' } else { 'None' }
 
         $cleanName = ($fi.Name -match '^[A-Za-z0-9][A-Za-z0-9 _.-]*\.[A-Za-z0-9]+$') -and
                      ($fi.Name -notmatch '\(\d+\)') -and
@@ -541,7 +665,12 @@ try {
             LastWriteTimeUtc        = $fi.LastWriteTimeUtc.ToString('u')
             RelativePath            = $relPath
             MetadataPresent         = [bool]$metaPresent
-            MetadataPath            = $(if ($metaPresent) { $metaPath } else { '' })
+            MetadataLocation        = $metaLocation
+            MetadataMatch           = $metaMatch
+            MetadataPath            = ($metaPaths -join '; ')
+            MetadataPaths           = $metaPaths
+            CompanionPath           = $companionPath
+            InTrash                 = [bool]($relPath -match $TrashPattern)
             KeeperPath              = ''
             KeeperMetadataPresent   = $false
             PathDepth               = [int](($relPath -split [regex]::Escape([string]$DirectorySeparator)).Count)
@@ -550,6 +679,7 @@ try {
             Hash                    = $null
             HashStatus              = 'NotHashed'
             MetadataScore           = 0
+            LocationScore           = 0
             DepthScore              = 0
             NameScore               = 0
             Score                   = 0
@@ -572,17 +702,24 @@ try {
         }
     }
 
-    # Informational: orphaned metadata JSONs.
-    $orphanedJsonCount = 0
+    # Informational: metadata coverage and orphaned metadata JSONs.
+    $metaSameFolderCount = @($media | Where-Object { $_.MetadataLocation -eq 'SameFolder' }).Count
+    $metaOtherPartCount = @($media | Where-Object { $_.MetadataLocation -eq 'OtherPart' }).Count
+    $metaNoneCount = $media.Count - $metaSameFolderCount - $metaOtherPartCount
+    $inTrashCount = @($media | Where-Object { $_.InTrash }).Count
 
-    foreach ($jsonPath in $metadataJsonSet) {
-        if (-not $mediaPathSet.Contains($jsonPath.Substring(0, $jsonPath.Length - $MetadataSuffix.Length))) {
-            $orphanedJsonCount++
-        }
+    Write-Log ('Metadata found for media: {0} same folder | {1} other export part only | {2} none' -f `
+        $metaSameFolderCount, $metaOtherPartCount, $metaNoneCount)
+
+    if ($inTrashCount -gt 0) {
+        Write-Log ('{0} media files are inside Google Photos {1} folders; they never win over a copy elsewhere.' -f `
+            $inTrashCount, ($TrashFolderNames -join '/'))
     }
 
+    $orphanedJsonCount = $metadataJsonSet.Count - $referencedJsonSet.Count
+
     if ($orphanedJsonCount -gt 0) {
-        Write-Log ('{0} supplemental-metadata JSON files have no matching media file (orphaned). They are ignored and left untouched.' -f $orphanedJsonCount) WARN
+        Write-Log ('{0} supplemental-metadata JSON files match no media file in any export part (orphaned). They are ignored and left untouched.' -f $orphanedJsonCount) WARN
     }
 
     # =========================================================================
@@ -692,11 +829,15 @@ try {
         $group = @($hg.Group)
 
         $minDepth = ($group | Measure-Object -Property PathDepth -Minimum).Minimum
-        $metaMembers = @($group | Where-Object { $_.MetadataPresent })
 
         foreach ($member in $group) {
             if ($member.MetadataPresent) {
                 $member.MetadataScore = 100
+            }
+
+            # A sidecar beside the file keeps the pair together for later metadata embedding.
+            if ($member.MetadataLocation -eq 'SameFolder') {
+                $member.LocationScore = 2
             }
 
             if ($member.PathDepth -eq $minDepth) {
@@ -707,15 +848,22 @@ try {
                 $member.NameScore = 1
             }
 
-            $member.Score = $member.MetadataScore + $member.DepthScore + $member.NameScore
+            $member.Score = $member.MetadataScore + $member.LocationScore + $member.DepthScore + $member.NameScore
             $member.GroupId = $gid
         }
+
+        # Eligibility 1: never pick a Trash/Bin copy while a copy exists elsewhere.
+        $nonTrashMembers = @($group | Where-Object { -not $_.InTrash })
+        $candidateSet = if ($nonTrashMembers.Count -gt 0) { $nonTrashMembers } else { $group }
+
+        # Eligibility 2: among those, only metadata-bearing copies when any exist.
+        $metaMembers = @($candidateSet | Where-Object { $_.MetadataPresent })
 
         if ($metaMembers.Count -gt 0) {
             $eligibleSet = $metaMembers
         }
         else {
-            $eligibleSet = $group
+            $eligibleSet = $candidateSet
         }
 
         $winner = $eligibleSet |
@@ -731,7 +879,10 @@ try {
         # Cache keeper record for later integrity validation
         $script:KeeperByPath[$winner.FullName] = $winner
 
-        if ($metaMembers.Count -eq 0) {
+        if ($metaMembers.Count -eq 0 -and @($group | Where-Object { $_.MetadataPresent }).Count -gt 0) {
+            $winner.Reason = 'KEEP: no copy outside Trash/Bin has metadata; deterministic fallback (score, shortest path, lexical)'
+        }
+        elseif ($metaMembers.Count -eq 0) {
             $winner.Reason = 'KEEP: no copy in group has metadata; deterministic fallback (score, shortest path, lexical)'
         }
         elseif ($metaMembers.Count -eq 1) {
@@ -741,12 +892,19 @@ try {
             $winner.Reason = 'KEEP: best-scoring of {0} metadata-bearing copies (eligibility restricted to metadata copies)' -f $metaMembers.Count
         }
 
+        if ($nonTrashMembers.Count -gt 0 -and $nonTrashMembers.Count -lt $group.Count) {
+            $winner.Reason += '; Trash/Bin copies excluded'
+        }
+
         foreach ($loser in ($group | Where-Object { $_.FullName -ne $winner.FullName })) {
             $loser.Recommendation = 'DELETE'
             $loser.KeeperPath = $winner.FullName
             $loser.KeeperMetadataPresent = $winner.MetadataPresent
 
-            if ((-not $loser.MetadataPresent) -and ($metaMembers.Count -gt 0)) {
+            if ($loser.InTrash -and -not $winner.InTrash) {
+                $loser.Reason = 'DELETE: duplicate content; copy is in Trash/Bin and another copy exists elsewhere'
+            }
+            elseif ((-not $loser.MetadataPresent) -and ($metaMembers.Count -gt 0)) {
                 $loser.Reason = 'DELETE: duplicate content; no metadata while another copy has metadata'
             }
             elseif ($loser.MetadataPresent) {
@@ -790,10 +948,14 @@ try {
             FileName                = $r.Name
             FileSizeBytes           = $r.Length
             MetadataPresent         = $r.MetadataPresent
+            MetadataLocation        = $r.MetadataLocation
+            MetadataMatch           = $r.MetadataMatch
             MetadataPath            = $r.MetadataPath
+            InTrash                 = $r.InTrash
             KeeperPath              = $r.KeeperPath
             KeeperMetadataPresent   = $r.KeeperMetadataPresent
             MetadataScore           = $r.MetadataScore
+            LocationScore           = $r.LocationScore
             DepthScore              = $r.DepthScore
             NameScore               = $r.NameScore
             Score                   = $r.Score
@@ -815,17 +977,19 @@ try {
         }
     })
 
+    # The report is read-only output, so it is written even under -WhatIf (v2.2 skipped it).
     if ($reportRows.Count -gt 0) {
-        $reportRows | Export-Csv -LiteralPath $ReportCsv -NoTypeInformation -Encoding UTF8
+        $reportRows | Export-Csv -LiteralPath $ReportCsv -NoTypeInformation -Encoding UTF8 -WhatIf:$false
         Write-Log ('Report written: {0} ({1} rows)' -f $ReportCsv, $reportRows.Count) SUCCESS
     }
     else {
         [pscustomobject][ordered]@{
             GroupId='';Hash='';FilePath='';RelativePath='';FileName='';FileSizeBytes='';
-            MetadataPresent='';MetadataPath='';KeeperPath='';KeeperMetadataPresent='';
-            MetadataScore='';DepthScore='';NameScore='';Score='';PathDepth='';PathLength='';
+            MetadataPresent='';MetadataLocation='';MetadataMatch='';MetadataPath='';InTrash='';
+            KeeperPath='';KeeperMetadataPresent='';
+            MetadataScore='';LocationScore='';DepthScore='';NameScore='';Score='';PathDepth='';PathLength='';
             LastWriteTimeUtc='';HashStatus='';Recommendation='';Reason='';PlannedAction='';Destination=''
-        } | Export-Csv -LiteralPath $ReportCsv -NoTypeInformation -Encoding UTF8
+        } | Export-Csv -LiteralPath $ReportCsv -NoTypeInformation -Encoding UTF8 -WhatIf:$false
 
         Write-Log ('No duplicate groups found. Header-only report written: {0}' -f $ReportCsv) SUCCESS
     }
@@ -848,20 +1012,37 @@ try {
             Where-Object { (@($_.Group | Where-Object { $_.MetadataPresent })).Count -gt 0 }
     ).Count
 
+    # Groups that would have had no metadata copy under v2.2's same-folder-only matching.
+    $groupsMetaOtherPartOnly = @(
+        $hashGroups |
+            Where-Object {
+                (@($_.Group | Where-Object { $_.MetadataPresent })).Count -gt 0 -and
+                (@($_.Group | Where-Object { $_.MetadataLocation -eq 'SameFolder' })).Count -eq 0
+            }
+    ).Count
+
+    $trashLosers = @($losers | Where-Object { $_.InTrash }).Count
+
     Write-Log '------------------------------- SUMMARY -------------------------------' HEADER
     Write-Log ('Total files scanned                 : {0}' -f $allFiles.Count)
     Write-Log ('Media files found                   : {0}' -f $media.Count)
     Write-Log ('Supplemental metadata JSON files    : {0}' -f $supplementalCount)
+    Write-Log ('Media with metadata: same folder    : {0}' -f $metaSameFolderCount)
+    Write-Log ('Media with metadata: other part only: {0}' -f $metaOtherPartCount)
+    Write-Log ('Media with no metadata found        : {0}' -f $metaNoneCount)
+    Write-Log ('Media inside Trash/Bin folders      : {0}' -f $inTrashCount)
     Write-Log ('Zero-byte media (excluded)          : {0}' -f $zeroByteFiles.Count)
     Write-Log ('Unique-size media (not hashed)      : {0}' -f $uniqueBySize)
     Write-Log ('Media files hashed                  : {0}' -f $totalToHash)
     Write-Log ('Hash failures (ReviewRequired)      : {0}' -f $hashFail)
     Write-Log ('Duplicate groups                    : {0}' -f $hashGroups.Count)
     Write-Log ('  groups where >=1 copy has metadata: {0}' -f $groupsWithMeta)
+    Write-Log ('    of which metadata only via other part: {0}' -f $groupsMetaOtherPartOnly)
     Write-Log ('  groups where no copy has metadata : {0}' -f ($hashGroups.Count - $groupsWithMeta))
     Write-Log ('Files in duplicate groups           : {0}' -f $dupRows.Count)
     Write-Log ('KEEP (winners)                      : {0}' -f $keepCount)
     Write-Log ('DELETE candidates (losers)          : {0}' -f $deleteCount)
+    Write-Log ('  of which inside Trash/Bin         : {0}' -f $trashLosers)
     Write-Log ('Space reclaimable from losers       : {0} bytes ({1} GB)' -f $reclaimBytes, $reclaimGB)
     Write-Log ('Enumeration completeness            : {0}' -f $(if ($scanComplete) { 'Complete' } else { "INCOMPLETE ($enumErrorCount errors)" }))
 
@@ -889,6 +1070,15 @@ try {
         $reviewCount = 0
         $moveFail = 0
         $plannedMoveCount = 0
+        $companionKeptCount = 0
+
+        # Sidecars used by any file that is not being quarantined (keepers and unique files).
+        $jsonNeededByRemaining = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($m in $media) {
+            if ($m.Recommendation -ne 'DELETE') {
+                foreach ($p in $m.MetadataPaths) { [void]$jsonNeededByRemaining.Add($p) }
+            }
+        }
 
         for ($i = 0; $i -lt $losers.Count; $i++) {
             $loser = $losers[$i]
@@ -932,12 +1122,26 @@ try {
 
             $destPath = Join-Path -Path $QuarantineRoot -ChildPath $loser.RelativePath
 
-            $jsonSrc = $loser.FullName + $MetadataSuffix
+            # Only the loser's own same-folder sidecar can travel with it, and only on request.
+            # Cross-part and edited-original sidecars are shared with other files and never move.
+            $jsonSrc = $loser.CompanionPath
 
-            $hasCompanionMetadata = $metadataJsonSet.Contains($jsonSrc) -and
+            $hasCompanionMetadata = $MoveMetadataWithMedia -and
+                                    (-not [string]::IsNullOrEmpty($jsonSrc)) -and
                                     (Test-Path -LiteralPath $jsonSrc -PathType Leaf)
 
-            $jsonDest = $destPath + $MetadataSuffix
+            if ($hasCompanionMetadata -and $jsonNeededByRemaining.Contains($jsonSrc)) {
+                $hasCompanionMetadata = $false
+                $companionKeptCount++
+                Write-Log ('METADATA-KEPT (sidecar is also the metadata of a file that stays; left in place): {0}' -f $jsonSrc) WARN
+            }
+
+            $jsonDest = if ($hasCompanionMetadata) {
+                Join-Path -Path $QuarantineRoot -ChildPath $jsonSrc.Substring($rootLen).TrimStart($DirectorySeparator)
+            }
+            else {
+                ''
+            }
 
             # Destination collision protection
             if (Test-Path -LiteralPath $destPath) {
@@ -1140,8 +1344,11 @@ try {
                             if ($hasCompanionMetadata) {
                                 'Media moved and companion metadata moved successfully'
                             }
+                            elseif ($loser.MetadataPresent) {
+                                'Media moved; metadata JSON left in place'
+                            }
                             else {
-                                'Media moved; no companion metadata present'
+                                'Media moved; no metadata JSON found'
                             }
                         )
                     })
@@ -1290,6 +1497,10 @@ try {
                 $moveFail
             ) $finishLevel
         }
+
+        if ($companionKeptCount -gt 0) {
+            Write-Log ('{0} sidecar(s) were left in place because a remaining file also uses them.' -f $companionKeptCount) WARN
+        }
     }
 
     # =========================================================================
@@ -1405,13 +1616,13 @@ try {
                 Write-Log ('Deletion audit manifest written: {0}. This is an audit record, not a rollback manifest.' -f $ActionsCsv) SUCCESS
             }
 
-            $orphaned = @($losers | Where-Object { $metadataJsonSet.Contains($_.FullName + $MetadataSuffix) })
+            $orphaned = @($losers | Where-Object { $_.CompanionPath })
 
             if ($orphaned.Count -gt 0) {
                 Write-Log ('NOTE: {0} companion .supplemental-metadata.json files were intentionally left in place for manual review:' -f $orphaned.Count) WARN
 
                 foreach ($o in $orphaned) {
-                    Write-Log ('  ORPHANED-JSON: {0}' -f ($o.FullName + $MetadataSuffix)) WARN
+                    Write-Log ('  ORPHANED-JSON: {0}' -f $o.CompanionPath) WARN
                 }
             }
 
