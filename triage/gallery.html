@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photo Triage Review</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e2e1dc;
+    --accent: #2f6fde; --reject: #c8372d; --reject-bg: #fbe9e7; --keep: #2e7d4f; --review: #b7791f;
+    --chip: #ecebe6; --shadow: 0 1px 2px rgba(0,0,0,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #20201e; --text: #ecebe6; --muted: #9c9b95; --line: #34342f;
+      --accent: #6b9cff; --reject: #ff6b5e; --reject-bg: #3a1f1c; --keep: #5cc48a; --review: #e0a648;
+      --chip: #2b2b28; --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 16px; box-shadow: var(--shadow); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  h1 { font-size: 18px; margin: 0 12px 0 0; }
+  .summary { color: var(--muted); margin-right: auto; }
+  .summary b { color: var(--text); }
+  button, select, input[type=search] { font: inherit; color: inherit; background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tabs { margin-top: 10px; }
+  .tab { border-radius: 999px; padding: 4px 12px; }
+  .tab.active { background: var(--text); color: var(--panel); border-color: var(--text); }
+  .tab small { opacity: .7; margin-left: 4px; }
+  .tools { margin-top: 10px; color: var(--muted); }
+  .tools label { display: inline-flex; gap: 6px; align-items: center; }
+  input[type=range] { width: 120px; }
+  main { padding: 16px; }
+  .hint { color: var(--muted); margin: 0 0 12px; max-width: 900px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+  .grid.pairs { grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
+  .card { background: var(--panel); border: 2px solid var(--line); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; box-shadow: var(--shadow); }
+  .card.reject { border-color: var(--reject); background: var(--reject-bg); }
+  .thumbs { display: flex; gap: 2px; background: var(--chip); cursor: pointer; position: relative; }
+  .thumbs figure { margin: 0; flex: 1; position: relative; }
+  .thumbs img { display: block; width: 100%; height: 170px; object-fit: contain; background: #0001; }
+  .card.reject .thumbs img { opacity: .55; }
+  .thumbs figcaption { position: absolute; left: 4px; bottom: 4px; font-size: 11px; background: #000a; color: #fff; padding: 1px 6px; border-radius: 4px; }
+  .badge { position: absolute; top: 6px; right: 6px; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 4px; color: #fff; background: var(--keep); }
+  .card.reject .badge { background: var(--reject); }
+  .badge.review { background: var(--review); }
+  .meta { padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+  .name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .note { color: var(--review); }
+  .meta a { color: var(--accent); text-decoration: none; }
+  .actions { display: flex; gap: 6px; padding: 0 10px 10px; margin-top: auto; }
+  .actions button { flex: 1; padding: 4px; }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+  #sentinel { height: 40px; }
+  @media (max-width: 600px) {
+    header { position: static; }
+    .grid, .grid.pairs { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+    .thumbs img { height: 130px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>Photo triage</h1>
+    <div class="summary" id="summary"></div>
+    <button class="primary" id="export">Export decisions (CSV)</button>
+  </div>
+  <div class="row tabs" id="tabs"></div>
+  <div class="row tools">
+    <label>Show
+      <select id="show">
+        <option value="all">all</option>
+        <option value="reject">marked for removal</option>
+        <option value="keep">kept</option>
+        <option value="review">flagged for review</option>
+      </select>
+    </label>
+    <input type="search" id="search" placeholder="Filter by name or folder">
+    <label>Confidence &ge; <input type="range" id="conf" min="0" max="100" step="5" value="0"> <span id="confv">0%</span></label>
+    <button id="rejectShown">Remove all shown</button>
+    <button id="keepShown">Keep all shown</button>
+  </div>
+</header>
+<main>
+  <p class="hint" id="hint"></p>
+  <div class="grid" id="grid"></div>
+  <div id="sentinel"></div>
+</main>
+<script src="data.js"></script>
+<script>
+(function () {
+  const D = window.TRIAGE;
+  if (!D) { document.getElementById('grid').innerHTML = '<p class="empty">data.js not found next to this page.</p>'; return; }
+
+  const LABELS = {
+    screenshot: 'Screenshots', meme: 'Memes', advert: 'Adverts', greeting: 'Greetings & quotes',
+    news: 'News graphics', whatsapp_copy: 'WhatsApp copies', document: 'Documents', photo: 'Photos',
+    unreadable: 'Unreadable', unknown: 'Unclassified'
+  };
+  const HINTS = {
+    whatsapp_copy: 'Left: the WhatsApp copy. Right: the photo you already have. Marked copies are removed; your photo is always kept.',
+    photo: 'Classified as personal photos. Nothing here is suggested for removal; skim for anything that slipped through.',
+    document: 'Documents, receipts and tickets are kept by default because some may matter.',
+    unreadable: 'These files could not be opened. They are kept; check them by hand.',
+  };
+  const ORDER = ['screenshot', 'meme', 'advert', 'greeting', 'news', 'whatsapp_copy', 'document', 'photo', 'unreadable', 'unknown'];
+  const CHUNK = 240;
+  const storeKey = 'triage-decisions-' + D.stamp;
+
+  const rows = D.rows;
+  const byId = new Map(rows.map(r => [r.id, r]));
+  let decisions = {};
+  try { decisions = JSON.parse(localStorage.getItem(storeKey) || '{}'); } catch (e) { decisions = {}; }
+  const decision = r => decisions[r.id] || (r.s === 'reject' ? 'reject' : 'keep');
+
+  function save() { try { localStorage.setItem(storeKey, JSON.stringify(decisions)); } catch (e) { /* storage unavailable */ } }
+
+  const present = ORDER.filter(c => rows.some(r => r.c === c));
+  let current = present[0] || 'photo';
+  let shown = [];
+  let rendered = 0;
+
+  const $ = id => document.getElementById(id);
+  const fmtBytes = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : Math.round(b / 1e3) + ' KB';
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const fileUrl = p => 'file:///' + encodeURI(p.replace(/\\/g, '/')).replace(/#/g, '%23').replace(/\?/g, '%3F');
+  const thumb = id => D.thumbs + '/' + id.slice(0, 2) + '/' + id + '.jpg';
+  const folder = r => { const parts = r.r.split(/[\\/]/); return parts.slice(0, -1).join(' / '); };
+
+  function summary() {
+    const rej = rows.filter(r => decision(r) === 'reject');
+    const bytes = rej.reduce((a, r) => a + r.b, 0);
+    $('summary').innerHTML = `<b>${rows.length.toLocaleString()}</b> images &middot; <b>${rej.length.toLocaleString()}</b> marked for removal (${fmtBytes(bytes)})`;
+  }
+
+  function tabs() {
+    $('tabs').innerHTML = present.map(c => {
+      const all = rows.filter(r => r.c === c);
+      const rej = all.filter(r => decision(r) === 'reject').length;
+      return `<button class="tab${c === current ? ' active' : ''}" data-c="${c}">${LABELS[c] || c}<small>${all.length.toLocaleString()}${rej ? ' · ' + rej.toLocaleString() + ' out' : ''}</small></button>`;
+    }).join('');
+  }
+
+  function filter() {
+    const show = $('show').value;
+    const q = $('search').value.trim().toLowerCase();
+    const min = Number($('conf').value) / 100;
+    shown = rows.filter(r => r.c === current
+      && (show === 'all' || (show === 'review' ? r.s === 'review' : decision(r) === show))
+      && (!q || r.r.toLowerCase().includes(q))
+      && (current === 'whatsapp_copy' || r.cf >= min));
+    shown.sort(current === 'whatsapp_copy' ? (a, b) => a.od - b.od || b.b - a.b : (a, b) => b.cf - a.cf);
+  }
+
+  function card(r) {
+    const d = decision(r);
+    const badge = d === 'reject' ? 'Remove' : (r.s === 'review' ? 'Review' : 'Keep');
+    const pics = r.c === 'whatsapp_copy'
+      ? `<figure><img loading="lazy" src="${thumb(r.id)}" alt=""><figcaption>WhatsApp ${r.w}×${r.h}</figcaption></figure>
+         <figure><img loading="lazy" src="${thumb(r.oid)}" alt=""><figcaption>Yours ${r.ow}×${r.oh}</figcaption></figure>`
+      : `<figure><img loading="lazy" src="${thumb(r.id)}" alt=""></figure>`;
+    const facts = [r.c === 'whatsapp_copy' ? `difference ${r.od}/64` : (r.cf ? Math.round(r.cf * 100) + '%' : ''),
+      `${r.w}×${r.h}`, fmtBytes(r.b), r.d].filter(Boolean).join(' · ');
+    const extra = [r.t3 ? 'model: ' + r.t3 : '', r.why].filter(Boolean).join(' · ');
+    const orig = r.o ? `<span class="muted">yours: <a href="${fileUrl(r.o)}" target="_blank" title="${esc(r.o)}">${esc(r.o.split(/[\\/]/).pop())}</a></span>` : '';
+    return `<div class="card${d === 'reject' ? ' reject' : ''}" data-id="${r.id}">
+      <div class="thumbs" title="Click to toggle">${pics}<span class="badge${badge === 'Review' ? ' review' : ''}">${badge}</span></div>
+      <div class="meta">
+        <a class="name" href="${fileUrl(r.p)}" target="_blank" title="${esc(r.p)}">${esc(r.r.split(/[\\/]/).pop())}</a>
+        <span class="muted">${esc(folder(r))}</span>
+        <span class="muted">${esc(facts)}</span>
+        ${r.nt ? `<span class="note">${esc(r.nt)}</span>` : ''}
+        ${extra ? `<span class="muted">${esc(extra)}</span>` : ''}
+        ${orig}
+      </div>
+      <div class="actions"><button data-act="keep">Keep</button><button data-act="reject">Remove</button></div>
+    </div>`;
+  }
+
+  function more() {
+    if (rendered >= shown.length) return;
+    $('grid').insertAdjacentHTML('beforeend', shown.slice(rendered, rendered + CHUNK).map(card).join(''));
+    rendered = Math.min(rendered + CHUNK, shown.length);
+  }
+
+  function render() {
+    filter();
+    tabs();
+    summary();
+    $('hint').textContent = (HINTS[current] || 'Sorted by confidence, highest first. Click a picture to toggle keep/remove.') +
+      ` ${shown.length.toLocaleString()} shown.`;
+    $('grid').className = 'grid' + (current === 'whatsapp_copy' ? ' pairs' : '');
+    $('grid').innerHTML = shown.length ? '' : '<p class="empty">Nothing to show with these filters.</p>';
+    rendered = 0;
+    more();
+  }
+
+  function setDecision(ids, value) {
+    for (const id of ids) {
+      const r = byId.get(id);
+      const dflt = r.s === 'reject' ? 'reject' : 'keep';
+      if (value === dflt) delete decisions[id]; else decisions[id] = value;
+    }
+    save();
+  }
+
+  function refreshCard(el) {
+    const r = byId.get(el.dataset.id);
+    el.outerHTML = card(r);
+    summary();
+    tabs();
+  }
+
+  $('grid').addEventListener('click', e => {
+    const el = e.target.closest('.card');
+    if (!el || e.target.closest('a')) return;
+    const r = byId.get(el.dataset.id);
+    const btn = e.target.closest('button');
+    if (btn) setDecision([r.id], btn.dataset.act);
+    else if (e.target.closest('.thumbs')) setDecision([r.id], decision(r) === 'reject' ? 'keep' : 'reject');
+    else return;
+    refreshCard(el);
+  });
+
+  $('tabs').addEventListener('click', e => {
+    const t = e.target.closest('.tab');
+    if (!t) return;
+    current = t.dataset.c;
+    render();
+    window.scrollTo(0, 0);
+  });
+
+  ['show', 'search', 'conf'].forEach(id => $(id).addEventListener('input', () => {
+    $('confv').textContent = $('conf').value + '%';
+    render();
+  }));
+
+  $('rejectShown').addEventListener('click', () => {
+    if (!shown.length || !confirm(`Mark all ${shown.length.toLocaleString()} shown images for removal?`)) return;
+    setDecision(shown.map(r => r.id), 'reject');
+    render();
+  });
+  $('keepShown').addEventListener('click', () => {
+    if (!shown.length) return;
+    setDecision(shown.map(r => r.id), 'keep');
+    render();
+  });
+
+  $('export').addEventListener('click', () => {
+    const q = s => '"' + String(s ?? '').replace(/"/g, '""') + '"';
+    const lines = ['Path,Decision,Category,Confidence,Suggestion,SizeBytes,CopyOf'];
+    for (const r of rows) lines.push([q(r.p), decision(r), r.c, r.cf, r.s, r.b, q(r.o)].join(','));
+    const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `TriageDecisions_${D.stamp}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    const n = rows.filter(r => decision(r) === 'reject').length;
+    alert(`Saved TriageDecisions_${D.stamp}.csv (${n.toLocaleString()} marked for removal).\nMove it next to this page or note where it was saved, then run Move-TriageRejects.ps1.`);
+  });
+
+  new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) more(); }, { rootMargin: '800px' })
+    .observe($('sentinel'));
+
+  render();
+})();
+</script>
+</body>
+</html>

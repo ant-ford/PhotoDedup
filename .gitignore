@@ -13,3 +13,7 @@
 # Local notes (contains private folder names)
 STATUS.md
 HANDOVER-PROMPT.md
+
+# Triage tool: private Python environment and caches
+triage/.venv/
+__pycache__/
