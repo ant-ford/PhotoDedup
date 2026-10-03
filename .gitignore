@@ -1,0 +1,15 @@
+# Never commit media, reports or archives
+*.jpg
+*.jpeg
+*.heic
+*.png
+*.mp4
+*.mov
+*.avi
+*.zip
+*.csv
+*.log
+
+# Local notes (contains private folder names)
+STATUS.md
+HANDOVER-PROMPT.md
