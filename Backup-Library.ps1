@@ -11,7 +11,8 @@ Copies the photo library to a backup drive and verifies every file by SHA-256.
    same SHA-256 hash. Results go to a CSV in -ReportRoot.
 
 -Mirror additionally deletes backup files that no longer exist in the source (robocopy
-/MIR). Use it only after checking the plan it prints; it asks for confirmation.
+/MIR). It lists them and asks for confirmation (or takes -MirrorConfirm 'DELETE FROM BACKUP').
+-MirrorPreview only lists what -Mirror would delete, then stops.
 
 .EXAMPLE
     .\Backup-Library.ps1                         # copy + verify
@@ -24,7 +25,9 @@ param(
     [string]$Destination = 'E:\Photos Library',
     [string]$ReportRoot = 'C:\Media\DedupeReports',
     [switch]$VerifyOnly,
+    [switch]$MirrorPreview,
     [switch]$Mirror,
+    [string]$MirrorConfirm = '',  # pass 'DELETE FROM BACKUP' to confirm -Mirror without a prompt
     [int]$Threads = 4
 )
 
@@ -54,11 +57,15 @@ if (-not $VerifyOnly) {
 
     $log = Join-Path $ReportRoot "Backup_${stamp}_robocopy.log"
     $opts = @('/E', '/COPY:DAT', '/DCOPY:DAT', '/R:2', '/W:5', '/XJ', '/MT:8', '/NP', '/NFL', '/NDL', "/UNILOG:$log")
-    if ($Mirror) {
+    if ($Mirror -or $MirrorPreview) {
         $extra = @(robocopy $Source $Destination /L /MIR /NJH /NJS /NP /NDL /FP /XJ | Where-Object { $_ -match '\*EXTRA File' })
         Write-Host ("-Mirror would delete {0} file(s) from the backup that are no longer in the library:" -f $extra.Count) -ForegroundColor Yellow
         $extra | Select-Object -First 20 | ForEach-Object { Write-Host "   $($_.Trim())" }
-        if ($extra.Count -gt 0 -and (Read-Host 'Type DELETE FROM BACKUP to continue') -cne 'DELETE FROM BACKUP') { throw 'Mirror cancelled; nothing was copied or deleted.' }
+        if ($MirrorPreview) { Write-Host 'Preview only - nothing was copied or deleted.'; exit 0 }
+        if ($extra.Count -gt 0) {
+            $answer = if ($MirrorConfirm) { $MirrorConfirm } else { Read-Host 'Type DELETE FROM BACKUP to continue' }
+            if ($answer -cne 'DELETE FROM BACKUP') { throw 'Mirror cancelled; nothing was copied or deleted.' }
+        }
         $opts = @('/MIR') + $opts
     }
     Write-Host "Copying to $Destination (log: $log) ..."

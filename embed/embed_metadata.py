@@ -191,9 +191,10 @@ class Zones:
 
 
 def parse_video_date(value, zone: ZoneInfo) -> dt.datetime | None:
-    """A QuickTime date as an aware local time; None for missing or placeholder (<1971) dates."""
+    """A QuickTime date as an aware local time; None for missing or placeholder dates
+    (before 1971, or more than a year in the future such as the 2036 overflow value)."""
     m = re.match(r"^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)?([+-]\d{2}:\d{2}|Z)?", str(value or ""))
-    if not m or int(m.group(1)) < 1971:
+    if not m or int(m.group(1)) < 1971 or int(m.group(1)) > dt.date.today().year + 1:
         return None
     try:
         base = dt.datetime(*map(int, m.groups()[:6]))
@@ -230,7 +231,8 @@ def fmt(d: dt.datetime) -> str:
 
 # ----------------------------------------------------------------------------- plan
 
-def plan_file(path: str, existing: dict, side: dict, zones: Zones, force_name_date: bool = False) -> dict:
+def plan_file(path: str, existing: dict, side: dict, zones: Zones, force_name_date: bool = False,
+              fallback_date: str = "") -> dict:
     """Decides what to add to one file. Returns a plan row (tags as [tag, value, undo] lists)."""
     ext = os.path.splitext(path)[1].lower()
     name = os.path.basename(path)
@@ -315,6 +317,10 @@ def plan_file(path: str, existing: dict, side: dict, zones: Zones, force_name_da
                 notes.append("sidecar date disagrees with file name; used file name")
         elif from_name:
             local, source = from_name.replace(tzinfo=zone), name_source
+        elif fallback_date:
+            # Last resort, e.g. the start date of the album the photo came from.
+            local, source = dt.datetime.fromisoformat(fallback_date).replace(tzinfo=zone), "fallback (approximate)"
+            notes.append("no date anywhere; approximate date supplied (e.g. album start)")
         if name_source == "whatsapp-name" and source == "whatsapp-name":
             notes.append("date only; time set to 12:00")
 
@@ -382,7 +388,8 @@ def plan_file(path: str, existing: dict, side: dict, zones: Zones, force_name_da
 
 
 def build_plan(source: str, exe: str, default_tz: str, limit: int = 0, workers: int = 4,
-               only: list[str] | None = None, force_name_date: bool = False) -> list[dict]:
+               only: list[str] | None = None, force_name_date: bool = False,
+               fallback_dates: dict[str, str] | None = None) -> list[dict]:
     media = core.scan_library(source, MEDIA)
     if only:
         wanted = {os.path.normcase(os.path.abspath(p)) for p in only}
@@ -421,7 +428,8 @@ def build_plan(source: str, exe: str, default_tz: str, limit: int = 0, workers: 
     plan = []
     for m in media:
         ex_row = existing.get(os.path.normcase(os.path.abspath(m.path)), {})
-        plan.append(plan_file(m.path, ex_row, read_sidecar_details(m.sidecars), zones, force_name_date))
+        fallback = (fallback_dates or {}).get(os.path.normcase(os.path.abspath(m.path)), "")
+        plan.append(plan_file(m.path, ex_row, read_sidecar_details(m.sidecars), zones, force_name_date, fallback))
     return plan
 
 
@@ -433,6 +441,7 @@ def summarize(plan: list[dict]) -> dict:
         "  from Google sidecar": sum(1 for p in plan if p["date_source"] == "sidecar" and p["tags"]),
         "  from WhatsApp name": sum(1 for p in plan if p["date_source"] == "whatsapp-name" and p["tags"]),
         "  from camera-style name": sum(1 for p in plan if p["date_source"] == "camera-name" and p["tags"]),
+        "  approximate (supplied fallback)": sum(1 for p in plan if p["date_source"].startswith("fallback") and p["tags"]),
         "date already in file": sum(1 for p in plan if p["date_source"] == "existing"),
         "no date found": sum(1 for p in plan if p["date_source"] == "none"),
         "GPS added": sum(1 for p in plan if any("GPS" in t[0] for t in p["tags"])),
@@ -594,6 +603,45 @@ def undo(log_path: str, exe: str, workers: int) -> tuple[int, int]:
     return counts["ok"], counts["failed"]
 
 
+def copy_metadata(pairs: dict[str, str], exe: str, log_path: str, backup_root: str) -> tuple[int, int]:
+    """Copies all metadata from source to target (e.g. a better-quality copy replacing an
+    older, already-tagged one). Each target is first copied to backup_root; the rewrite is
+    verified like any other (picture fingerprint unchanged, date read back).
+    pairs: {target path: source path}.
+    """
+    et = ExifTool(exe)
+    ok = failed = 0
+    try:
+        with open(log_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["Target", "Source", "Result", "BackupOfTarget", "Detail"])
+            for target, source in pairs.items():
+                backup = os.path.join(backup_root, os.path.splitdrive(target)[1].lstrip("\\/"))
+                try:
+                    if os.path.exists(backup):
+                        raise RuntimeError("a backup of this file already exists; not overwriting it")
+                    os.makedirs(os.path.dirname(backup), exist_ok=True)
+                    shutil.copy2(target, backup)
+                    src = read_check(et, source)
+                    expect = [["EXIF:DateTimeOriginal", "", []]] if src.get("EXIF:DateTimeOriginal") else []
+                    args = ["-tagsfromfile", source, "-all:all", "-unsafe",
+                            "-FileModifyDate<FileModifyDate", "-FileCreateDate<FileCreateDate"]
+                    error = rewrite(et, target, args, expect, True)
+                    if not error and src.get("EXIF:DateTimeOriginal"):
+                        if read_check(et, target).get("EXIF:DateTimeOriginal") != src["EXIF:DateTimeOriginal"]:
+                            error = "date did not match the source after copying"
+                except Exception as e:  # noqa: BLE001
+                    error = str(e)[:300]
+                ok += not error
+                failed += bool(error)
+                w.writerow([target, source, "OK" if not error else "FAILED", backup, error])
+                if error:
+                    print(f"  FAILED: {target} :: {error}", flush=True)
+    finally:
+        et.close()
+    return ok, failed
+
+
 def build_keyword_plan(keyword_map: dict[str, list[str]], exe: str) -> list[dict]:
     """Plan rows that add keywords (XMP dc:Subject) to files, e.g. album names.
 
@@ -636,8 +684,11 @@ def build_keyword_plan(keyword_map: dict[str, list[str]], exe: str) -> list[dict
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["plan", "apply", "undo", "keywords"],
-                    help="keywords: add keywords from --map (plan only unless --apply)")
+    ap.add_argument("command", choices=["plan", "apply", "undo", "keywords", "copy-meta"],
+                    help="keywords: add keywords from --map (plan only unless --apply); "
+                         "copy-meta: copy all metadata, --map {target: source} (needs --apply and --expected)")
+    ap.add_argument("--backup-root", default=r"C:\Media\DuplicateQuarantine-3\BeforeMetadataCopy",
+                    help="copy-meta: where each target's original is kept")
     ap.add_argument("--map", help="keywords: JSON file {file path: [keyword, ...]}")
     ap.add_argument("--apply", action="store_true", help="keywords: write them (needs --expected)")
     ap.add_argument("--source", default=r"C:\Media\Imports")
@@ -649,6 +700,7 @@ def main(argv=None) -> int:
     ap.add_argument("--only", action="append", default=[], help="only this file (repeatable)")
     ap.add_argument("--ignore-minor-errors", action="store_true",
                     help="let ExifTool write despite minor problems in a file's existing metadata (-m)")
+    ap.add_argument("--fallback-dates", help="JSON {file path: 'YYYY-MM-DDTHH:MM:SS'} used only when a file has no date anywhere")
     ap.add_argument("--force-name-date", action="store_true",
                     help="replace the date with the one in a camera-style file name (use with --only)")
     ap.add_argument("--repair-metadata", action="store_true",
@@ -660,6 +712,23 @@ def main(argv=None) -> int:
     exe = args.exiftool or find_exiftool()
     stamp = time.strftime("%Y%m%d_%H%M%S")
     os.makedirs(args.report_root, exist_ok=True)
+
+    if args.command == "copy-meta":
+        if not args.map:
+            ap.error("copy-meta needs --map")
+        with open(args.map, encoding="utf-8") as f:
+            pairs = json.load(f)
+        print(f"Copy metadata: {len(pairs):,} files.")
+        if not args.apply:
+            print("Plan only - nothing was changed.")
+            return 0
+        if args.expected != len(pairs):
+            print(f"The map has {len(pairs):,} files, not --expected {args.expected:,}. Nothing was changed.")
+            return 2
+        log_path = os.path.join(args.report_root, f"EmbedLog_{stamp}_copymeta.csv")
+        ok, failed = copy_metadata(pairs, exe, log_path, args.backup_root)
+        print(f"Done: {ok:,} files updated, {failed:,} failed. Log: {log_path}; originals kept in {args.backup_root}")
+        return 1 if failed else 0
 
     if args.command == "keywords":
         if not args.map:
@@ -690,7 +759,11 @@ def main(argv=None) -> int:
     source = os.path.realpath(args.source)
     if args.force_name_date and not args.only:
         ap.error("--force-name-date replaces existing dates; name the files with --only")
-    plan = build_plan(source, exe, args.default_tz, args.limit, args.workers, args.only, args.force_name_date)
+    fallback_dates = {}
+    if args.fallback_dates:
+        with open(args.fallback_dates, encoding="utf-8") as f:
+            fallback_dates = {os.path.normcase(os.path.abspath(p)): v for p, v in json.load(f).items()}
+    plan = build_plan(source, exe, args.default_tz, args.limit, args.workers, args.only, args.force_name_date, fallback_dates)
     plan_csv = os.path.join(args.report_root, f"EmbedPlan_{stamp}.csv")
     write_plan_csv(plan, plan_csv)
 
@@ -711,6 +784,9 @@ def main(argv=None) -> int:
         return 2
 
     log_path = os.path.join(args.report_root, f"EmbedLog_{stamp}.csv")
+    while os.path.exists(log_path):  # never reuse an undo log
+        stamp += "x"
+        log_path = os.path.join(args.report_root, f"EmbedLog_{stamp}.csv")
     print(f"Writing metadata to {to_change:,} files. Undo record: {log_path}")
     if args.repair_metadata and not args.only:
         ap.error("--repair-metadata rewrites all metadata; name the files with --only")

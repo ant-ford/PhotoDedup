@@ -85,6 +85,9 @@ def classify(worst: float, a_dims: str, b_dims: str, rotation: int) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", default=r"C:\Media\Library")
+    ap.add_argument("--new", action="append", default=[],
+                    help="folder of newly added photos (repeatable): compared with --source and each other; "
+                         "only pairs involving a new photo are reported")
     ap.add_argument("--report-root", default=r"C:\Media\DedupeReports")
     ap.add_argument("--max-distance", type=int, default=3, help="perceptual hash bits that may differ (default 3)")
     ap.add_argument("--max-pixel-diff", type=float, default=6.0, help="mean grey difference 0-255 to count as the same picture (default 6)")
@@ -96,7 +99,10 @@ def main(argv=None) -> int:
     thumbs = os.path.join(out_dir, "thumbs")
     os.makedirs(thumbs, exist_ok=True)
 
-    paths = [os.path.join(d, f) for d, _, fs in os.walk(args.source) for f in fs if os.path.splitext(f)[1].lower() in IMAGES]
+    roots = [args.source] + args.new
+    paths = [os.path.join(d, f) for root in roots for d, _, fs in os.walk(root) for f in fs if os.path.splitext(f)[1].lower() in IMAGES]
+    new_prefixes = tuple(os.path.normcase(os.path.abspath(n)) + os.sep for n in args.new)
+    is_new = lambda p: bool(new_prefixes) and os.path.normcase(p).startswith(new_prefixes)  # noqa: E731
     print(f"{len(paths):,} images under {args.source}. Fingerprinting ...", flush=True)
     keys = [f"{i:06d}" for i in range(len(paths))]
     info = [None] * len(paths)
@@ -128,6 +134,8 @@ def main(argv=None) -> int:
                 for j in index.get((c, (hr >> (16 * c)) & 0xFFFF), []):
                     if j <= i or (i, j) in pairs:
                         continue
+                    if new_prefixes and not (is_new(paths[i]) or is_new(paths[j])):
+                        continue  # both already in the library: reviewed separately
                     if core.hamming(hr, info[j][1][0]) > args.max_distance:
                         continue
                     # Same picture? Compare pixels with i rotated by the matching angle.

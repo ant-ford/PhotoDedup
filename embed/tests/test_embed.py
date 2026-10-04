@@ -187,6 +187,36 @@ class EmbedTests(unittest.TestCase):
         self.assertEqual(em.main(["undo", "--log", self.latest("EmbedLog_*.csv"), "--workers", "1"]), 0)
         self.assertEqual(read(p)["EXIF:DateTimeOriginal"], "2004:02:10 02:16:14", "undo restores the old date")
 
+    def test_fallback_date_only_when_nothing_else(self):
+        undated = self.p(GP, "scan.jpg")
+        dated = self.p(GP, "IMG-20230505-WA0001.jpg")
+        Image.new("RGB", (32, 24), (5, 5, 5)).save(undated, quality=90)
+        Image.new("RGB", (32, 24), (6, 6, 6)).save(dated, quality=90)
+        fb = os.path.join(self.tmp, "fallback.json")
+        json.dump({undated: "2015-06-05T12:00:00", dated: "2015-06-05T12:00:00"}, open(fb, "w"))
+        self.assertEqual(self.run_cmd("apply", "--fallback-dates", fb, "--expected", "2"), 0)
+        self.assertEqual(read(undated)["EXIF:DateTimeOriginal"], "2015:06:05 12:00:00")
+        self.assertEqual(read(dated)["EXIF:DateTimeOriginal"], "2023:05:05 12:00:00", "name date beats the fallback")
+
+    def test_copy_meta_keeps_backup_and_picture(self):
+        src, dst = self.p(GP, "old.jpg"), self.p(GP, "better.jpg")
+        ex = Image.Exif()
+        ex[0x8769] = {0x9003: "2016:05:22 10:00:00"}
+        Image.new("RGB", (32, 24), (40, 40, 40)).save(src, exif=ex, quality=60)
+        Image.new("RGB", (64, 48), (40, 40, 40)).save(dst, quality=95)
+        subprocess.run([EXE, "-overwrite_original", "-XMP-dc:Subject=Trip", src], capture_output=True)
+        h = read(dst, "-ImageDataHash")["File:ImageDataHash"]
+        m = os.path.join(self.tmp, "pairs.json")
+        json.dump({dst: src}, open(m, "w"))
+        backup = os.path.join(self.tmp, "backup")
+        self.assertEqual(em.main(["copy-meta", "--map", m, "--report-root", self.rep, "--apply", "--expected", "1",
+                                  "--backup-root", backup]), 0)
+        after = read(dst, "-ImageDataHash", "-XMP:Subject", "-EXIF:DateTimeOriginal")
+        self.assertEqual(after["EXIF:DateTimeOriginal"], "2016:05:22 10:00:00")
+        self.assertEqual(after["XMP:Subject"], "Trip")
+        self.assertEqual(after["File:ImageDataHash"], h, "picture unchanged")
+        self.assertTrue(glob.glob(os.path.join(backup, "**", "better.jpg"), recursive=True), "original kept")
+
     @unittest.skipUnless(SAMPLE_VIDEO, "no MP4 in Imports to copy")
     def test_video_placeholder_date(self):
         dest = self.p(GP, "IMG_6397.MOV".replace(".MOV", ".mp4"))

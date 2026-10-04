@@ -154,6 +154,9 @@ Write-Progress -Activity 'Moving rejected images to holding' -Completed
 
 if ($actions.Count -gt 0) {
     $manifest = Join-Path $ReportRoot "TriageRejects_${stamp}_Actions.csv"
+    for ($n = 2; Test-Path -LiteralPath $manifest; $n++) {  # two runs in the same second must not share a manifest
+        $manifest = Join-Path $ReportRoot "TriageRejects_${stamp}_${n}_Actions.csv"
+    }
     $actions | Export-Csv -LiteralPath $manifest -NoTypeInformation -Encoding UTF8 -WhatIf:$false
     Write-Host "Manifest (rollback record for Restore-Quarantine.ps1): $manifest"
 }

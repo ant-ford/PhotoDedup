@@ -74,6 +74,25 @@ class RefileTests(unittest.TestCase):
         for p in (a, b, c, d):
             self.assertTrue(os.path.exists(p), f"restored {p}")
 
+    def test_albums_only_moves_listed_files_within_library(self):
+        lib = self.lib
+        x = os.path.join(lib, "2023", "2023-05", "x.jpg")
+        y = os.path.join(lib, "2023", "2023-05", "y.jpg")
+        for p in (x, y):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            Image.new("RGB", (16, 16), (1, 1, 1)).save(p)
+            subprocess.run([EXE, "-overwrite_original", "-EXIF:DateTimeOriginal=2023:05:05 10:00:00", p], capture_output=True)
+        albums = os.path.join(self.tmp, "albums.json")
+        json.dump({x: "2023-05 Trip"}, open(albums, "w"))
+        base = ["--source", lib, "--library", lib, "--albums", albums, "--albums-only", "--report-root", self.rep]
+        self.assertEqual(rl.main(["apply", *base, "--expected", "1"]), 0)
+        self.assertTrue(os.path.exists(os.path.join(lib, "Albums", "2023-05 Trip", "x.jpg")))
+        self.assertTrue(os.path.exists(y), "unlisted file untouched")
+        json.dump({os.path.join(lib, "Albums", "2023-05 Trip", "x.jpg"): "2023-05 Trip"}, open(albums, "w"))
+        self.assertEqual(rl.main(["apply", *base, "--expected", "0"]), 0, "already in place: nothing to move")
+        with self.assertRaises(SystemExit):
+            rl.main(["plan", "--source", lib, "--library", lib, "--report-root", self.rep])
+
     def test_refuses_library_inside_source(self):
         with self.assertRaises(SystemExit):
             rl.main(["plan", "--source", self.tmp, "--library", os.path.join(self.tmp, "Library"), "--report-root", self.rep])

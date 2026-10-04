@@ -47,13 +47,18 @@ def unique(dest: str, taken: set[str]) -> str:
     return candidate
 
 
-def build(source: str, library: str, albums: dict[str, str], exe: str, default_tz: str) -> list[dict]:
-    dated = em.build_plan(source, exe, default_tz)  # reads each file's date taken
+def build(source: str, library: str, albums: dict[str, str], exe: str, default_tz: str,
+          albums_only: bool = False) -> list[dict]:
     album_of = {os.path.normcase(os.path.abspath(p)): safe_folder(f) for p, f in albums.items() if f}
+    only = [p for p in albums if albums[p]] if albums_only else None
+    dated = em.build_plan(source, exe, default_tz, only=only) if not albums_only or only else []
     rows = []
     for d in sorted(dated, key=lambda r: r["path"].lower()):
         path = d["path"]
         folder = album_of.get(os.path.normcase(path))
+        if albums_only and (not folder or os.path.normcase(os.path.dirname(path)) ==
+                            os.path.normcase(os.path.join(library, "Albums", folder))):
+            continue  # albums-only: move files into their album folder; leave everything else
         stamp = d["date_taken"]  # 'YYYY:MM:DD HH:MM:SS+hh:mm' or ''
         if folder:
             target_dir, reason = os.path.join(library, "Albums", folder), "album"
@@ -64,7 +69,7 @@ def build(source: str, library: str, albums: dict[str, str], exe: str, default_t
             target_dir, reason = os.path.join(library, "Undated"), "undated"
         rows.append({"source": path, "dir": target_dir, "reason": reason, "date": stamp, "size": os.path.getsize(path)})
 
-    taken: set[str] = set()
+    taken: set[str] = set()  # names planned in this run
     for r in sorted(rows, key=lambda r: (r["dir"].lower(), os.path.basename(r["source"]).lower(), r["source"].lower())):
         r["dest"] = unique(os.path.join(r["dir"], os.path.basename(r["source"])), taken)
         r["renamed"] = os.path.basename(r["dest"]) != os.path.basename(r["source"])
@@ -116,10 +121,14 @@ def main(argv=None) -> int:
     ap.add_argument("--report-root", default=r"C:\Media\DedupeReports")
     ap.add_argument("--default-tz", default="Asia/Hong_Kong")
     ap.add_argument("--expected", type=int, default=-1)
+    ap.add_argument("--albums-only", action="store_true",
+                    help="only move the files listed in --albums into their album folders (e.g. --source is the Library)")
     args = ap.parse_args(argv)
 
     source, library = os.path.realpath(args.source), os.path.realpath(args.library)
-    if library.lower().startswith(source.lower() + os.sep) or source.lower().startswith(library.lower() + os.sep):
+    same = source.lower() == library.lower()
+    inside = same or library.lower().startswith(source.lower() + os.sep) or source.lower().startswith(library.lower() + os.sep)
+    if inside and not (args.albums_only and same):
         ap.error("library and source must not be inside each other")
     if os.path.splitdrive(source)[0].lower() != os.path.splitdrive(library)[0].lower():
         ap.error("library must be on the same drive as the source (moves are renames)")
@@ -128,7 +137,7 @@ def main(argv=None) -> int:
         with open(args.albums, encoding="utf-8") as f:
             albums = json.load(f)
 
-    rows = build(source, library, albums, em.find_exiftool(), args.default_tz)
+    rows = build(source, library, albums, em.find_exiftool(), args.default_tz, args.albums_only)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     plan_csv = os.path.join(args.report_root, f"RefilePlan_{stamp}.csv")
     write_plan(rows, plan_csv)
@@ -149,6 +158,10 @@ def main(argv=None) -> int:
         return 2
 
     manifest = os.path.join(args.report_root, f"Refile_{stamp}_Actions.csv")
+    n = 2
+    while os.path.exists(manifest):  # two runs in the same second must not share a manifest
+        manifest = os.path.join(args.report_root, f"Refile_{stamp}_{n}_Actions.csv")
+        n += 1
     print(f"Moving {len(rows):,} files. Manifest (rollback for Restore-Quarantine.ps1): {manifest}")
     ok, failed = apply(rows, manifest)
     print(f"Done: {ok:,} moved, {failed:,} failed.")
