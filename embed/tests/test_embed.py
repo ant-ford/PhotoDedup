@@ -29,7 +29,8 @@ except ImportError:
 
 EXE = em.find_exiftool()
 GP = os.path.join("partA", "Takeout", "Google Photos", "Photos from 2018")
-SAMPLE_VIDEO = next(iter(sorted(glob.glob(r"C:\Media\Imports\**\*.mp4", recursive=True),
+SAMPLE_VIDEO = next(iter(sorted(glob.glob(r"C:\Media\Imports\**\*.mp4", recursive=True)
+                                + glob.glob(r"C:\Media\Library\**\*.mp4", recursive=True),
                                 key=os.path.getsize)), None)
 
 
@@ -65,7 +66,7 @@ class EmbedTests(unittest.TestCase):
         sidecar(self.p(GP, "plain.jpg.supplemental-metadata.json"),
                 photoTakenTime={"timestamp": "1530860833"},  # 2018-07-06 07:07:13 UTC
                 geoData={"latitude": 22.271106, "longitude": 114.130844, "altitude": 182.2},
-                description="Beach day", people=[{"name": "Adam"}, {"name": "Liam"}])
+                description="Beach day", people=[{"name": "Alex"}, {"name": "Sam"}])
         # 2. Camera date already present: must not change; sidecar time differs.
         ex = Image.Exif()
         ex[0x8769] = {0x9003: "2018:07:06 09:00:00"}
@@ -131,7 +132,7 @@ class EmbedTests(unittest.TestCase):
         self.assertAlmostEqual(plain["EXIF:GPSLatitude"], 22.271106, places=5)
         self.assertAlmostEqual(plain["EXIF:GPSLongitude"], 114.130844, places=5)
         self.assertEqual(plain["XMP:Description"], "Beach day")
-        self.assertEqual(plain["XMP:PersonInImage"], ["Adam", "Liam"])
+        self.assertEqual(plain["XMP:PersonInImage"], ["Alex", "Sam"])
         self.assertTrue(str(plain["File:FileModifyDate"]).startswith("2018:07:06 15:07:13"))
 
         self.assertEqual(read(self.p(GP, "camera.jpg"))["EXIF:DateTimeOriginal"], "2018:07:06 09:00:00", "existing date kept")
@@ -154,13 +155,66 @@ class EmbedTests(unittest.TestCase):
         for f in files:
             self.assertEqual(Image.open(f).tobytes(), pixels[f])
 
+    def test_keywords(self):
+        self.build()
+        target = self.p(GP, "plain.jpg")
+        subprocess.run([EXE, "-overwrite_original", "-XMP-dc:Subject=Existing", "-FileModifyDate=2018:07:06 15:07:13+08:00", target],
+                       capture_output=True)
+        before = read(target, "-FileModifyDate", "-ImageDataHash")
+        kmap = os.path.join(self.tmp, "map.json")
+        with open(kmap, "w", encoding="utf-8") as f:
+            json.dump({target: ["Trip 2022/23", "Existing"], self.p(GP, "old.bmp"): ["Not writable"]}, f)
+        self.assertEqual(em.main(["keywords", "--map", kmap, "--report-root", self.rep]), 0)
+        self.assertEqual(em.main(["keywords", "--map", kmap, "--report-root", self.rep, "--apply", "--expected", "2"]), 2)
+        self.assertEqual(em.main(["keywords", "--map", kmap, "--report-root", self.rep, "--apply", "--expected", "1"]), 0)
+        after = read(target, "-XMP:Subject", "-FileModifyDate", "-ImageDataHash")
+        self.assertEqual(after["XMP:Subject"], ["Existing", "Trip 2022/23"], "added once, existing kept")
+        self.assertEqual(after["File:FileModifyDate"], before["File:FileModifyDate"], "Windows date kept")
+        self.assertEqual(after["File:ImageDataHash"], before["File:ImageDataHash"])
+        log = self.latest("EmbedLog_*_keywords.csv")
+        self.assertEqual(em.main(["undo", "--log", log, "--workers", "1"]), 0)
+        self.assertEqual(read(target, "-XMP:Subject")["XMP:Subject"], "Existing")
+
+    def test_force_name_date(self):
+        p = self.p(GP, "20140215_193544.jpg")
+        ex = Image.Exif()
+        ex[0x8769] = {0x9003: "2004:02:10 02:16:14"}
+        Image.new("RGB", (32, 24), (9, 9, 9)).save(p, exif=ex, quality=90)
+        with self.assertRaises(SystemExit):  # refused without --only
+            self.run_cmd("plan", "--force-name-date")
+        self.assertEqual(self.run_cmd("apply", "--only", p, "--force-name-date", "--expected", "1"), 0)
+        self.assertEqual(read(p)["EXIF:DateTimeOriginal"], "2014:02:15 19:35:44")
+        self.assertEqual(em.main(["undo", "--log", self.latest("EmbedLog_*.csv"), "--workers", "1"]), 0)
+        self.assertEqual(read(p)["EXIF:DateTimeOriginal"], "2004:02:10 02:16:14", "undo restores the old date")
+
+    @unittest.skipUnless(SAMPLE_VIDEO, "no MP4 in Imports to copy")
+    def test_video_placeholder_date(self):
+        dest = self.p(GP, "IMG_6397.MOV".replace(".MOV", ".mp4"))
+        shutil.copyfile(SAMPLE_VIDEO, dest)
+        subprocess.run([EXE, "-overwrite_original", "-api", "QuickTimeUTC=1", "-QuickTime:CreateDate=1970:01:01 00:00:00",
+                        "-Keys:CreationDate=2016:11:22 23:30:47+08:00", dest], capture_output=True)
+        self.assertEqual(self.run_cmd("apply", "--expected", "1"), 0)
+        v = read(dest, "-QuickTime:CreateDate")
+        self.assertTrue(str(v["QuickTime:CreateDate"]).startswith("2016:11:22"), v)
+
+    @unittest.skipUnless(SAMPLE_VIDEO, "no MP4 in Imports to copy")
+    def test_video_placeholder_uses_modify_date_over_upload_date(self):
+        dest = self.p(GP, "IMG_5842.mp4")
+        shutil.copyfile(SAMPLE_VIDEO, dest)
+        subprocess.run([EXE, "-overwrite_original", "-api", "QuickTimeUTC=1", "-QuickTime:CreateDate=1970:01:01 00:00:00",
+                        "-Keys:CreationDate=", "-QuickTime:ModifyDate=2016:11:22 23:21:17+08:00", dest], capture_output=True)
+        sidecar(dest + ".supplemental-metadata.json", photoTakenTime={"timestamp": "1769490360"})  # 2026 upload
+        self.assertEqual(self.run_cmd("apply", "--expected", "1"), 0)
+        self.assertTrue(str(read(dest, "-QuickTime:CreateDate")["QuickTime:CreateDate"]).startswith("2016:11:22"))
+
     @unittest.skipUnless(SAMPLE_VIDEO, "no MP4 in Imports to copy")
     def test_video(self):
         dest = self.p(GP, "clip.mp4")
         shutil.copyfile(SAMPLE_VIDEO, dest)
         # Clear its date in the copy so there is something to fill.
         subprocess.run([EXE, "-overwrite_original", "-QuickTime:CreateDate=0000:00:00 00:00:00",
-                        "-Keys:CreationDate=", "-GPSCoordinates=", dest], capture_output=True)
+                        "-QuickTime:ModifyDate=0000:00:00 00:00:00", "-Keys:CreationDate=", "-GPSCoordinates=", dest],
+                       capture_output=True)
         sidecar(dest + ".supplemental-metadata.json", photoTakenTime={"timestamp": "1530860833"},
                 geoData={"latitude": 51.5, "longitude": -0.12, "altitude": 10})
         h0 = read(dest, "-ImageDataHash")["File:ImageDataHash"]

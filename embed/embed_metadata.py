@@ -54,9 +54,11 @@ VERIFY = {
     "QuickTime:CreateDate": "QuickTime:CreateDate", "XMP-dc:Description": "XMP:Description",
 }
 
+LIST_VERIFY = {"XMP-dc:Subject+": "XMP:Subject", "XMP-iptcExt:PersonInImage+": "XMP:PersonInImage"}
+
 READ_TAGS = [
     "-EXIF:DateTimeOriginal", "-EXIF:CreateDate", "-EXIF:OffsetTimeOriginal",
-    "-XMP:DateTimeOriginal", "-QuickTime:CreateDate", "-QuickTime:CreationDate",
+    "-XMP:DateTimeOriginal", "-QuickTime:CreateDate", "-QuickTime:CreationDate", "-QuickTime:ModifyDate",
     "-GPSLatitude#", "-GPSLongitude#", "-GPSCoordinates#",
     "-EXIF:ImageDescription", "-XMP-dc:Description", "-XMP-iptcExt:PersonInImage", "-XMP-dc:Subject",
     "-FileModifyDate", "-FileCreateDate",
@@ -188,6 +190,22 @@ class Zones:
             return self.default
 
 
+def parse_video_date(value, zone: ZoneInfo) -> dt.datetime | None:
+    """A QuickTime date as an aware local time; None for missing or placeholder (<1971) dates."""
+    m = re.match(r"^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)?([+-]\d{2}:\d{2}|Z)?", str(value or ""))
+    if not m or int(m.group(1)) < 1971:
+        return None
+    try:
+        base = dt.datetime(*map(int, m.groups()[:6]))
+    except ValueError:
+        return None
+    if m.group(7) and m.group(7) != "Z":
+        sign = 1 if m.group(7)[0] == "+" else -1
+        h, mi = map(int, m.group(7)[1:].split(":"))
+        return base.replace(tzinfo=dt.timezone(sign * dt.timedelta(hours=h, minutes=mi)))
+    return base.replace(tzinfo=dt.timezone.utc).astimezone(zone)
+
+
 def valid_gps(lat, lon) -> tuple[float | None, float | None]:
     """Decimal coordinates, or (None, None) for missing, malformed, out-of-range or 0,0 values."""
     try:
@@ -212,7 +230,7 @@ def fmt(d: dt.datetime) -> str:
 
 # ----------------------------------------------------------------------------- plan
 
-def plan_file(path: str, existing: dict, side: dict, zones: Zones) -> dict:
+def plan_file(path: str, existing: dict, side: dict, zones: Zones, force_name_date: bool = False) -> dict:
     """Decides what to add to one file. Returns a plan row (tags as [tag, value, undo] lists)."""
     ext = os.path.splitext(path)[1].lower()
     name = os.path.basename(path)
@@ -242,19 +260,36 @@ def plan_file(path: str, existing: dict, side: dict, zones: Zones) -> dict:
     # --- date taken: existing value wins
     local = None
     source = ""
-    if is_video:
-        qt = existing.get("QuickTime:CreateDate")
-        if qt and not str(qt).startswith("0000"):
-            m = re.match(r"^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})([+-]\d{2}:\d{2}|Z)?", str(qt))
-            if m:
-                base = dt.datetime(*map(int, m.groups()[:6]))
-                if m.group(7) and m.group(7) != "Z":
-                    sign = 1 if m.group(7)[0] == "+" else -1
-                    h, mi = map(int, m.group(7)[1:].split(":"))
-                    local = base.replace(tzinfo=dt.timezone(sign * dt.timedelta(hours=h, minutes=mi)))
+    fill_video_dates = forced = False
+    if force_name_date:
+        from_name, name_source = name_date(name)
+        if from_name is not None and name_source == "camera-name":
+            local, source, forced = from_name.replace(tzinfo=zone), "camera-name (forced)", True
+            notes.append("date taken from the file name on request; existing date replaced")
+    if forced:
+        pass
+    elif is_video:
+        local = parse_video_date(existing.get("QuickTime:CreateDate"), zone)
+        if local is not None:
+            source = "existing"
+        else:
+            # A zero/1970 CreateDate is a placeholder. Apple's CreationDate holds the real date
+            # when present; otherwise the sidecar date if not after the file's ModifyDate (later
+            # sidecar dates are upload dates); otherwise ModifyDate (an edit/export time, close).
+            creation = parse_video_date(existing.get("QuickTime:CreationDate"), zone)
+            modify = parse_video_date(existing.get("QuickTime:ModifyDate"), zone)
+            side_local = dt.datetime.fromtimestamp(side["taken"], zone) if side["taken"] is not None else None
+            if creation is not None:
+                local, source, fill_video_dates = creation, "existing", True
+                notes.append("video date was a placeholder; used Apple CreationDate")
+            elif modify is not None:
+                fill_video_dates = True
+                if side_local is not None and side_local <= modify + dt.timedelta(days=1):
+                    local, source = side_local, "sidecar"
+                    notes.append("video date was a placeholder; used sidecar date")
                 else:
-                    local = base.replace(tzinfo=dt.timezone.utc).astimezone(zone)
-                source = "existing"
+                    local, source = modify, "existing"
+                    notes.append("video date was a placeholder; approximate date from its last edit")
     else:
         dto = parse_exif_date(existing.get("EXIF:DateTimeOriginal")) or parse_exif_date(existing.get("XMP:DateTimeOriginal"))
         if dto:
@@ -283,22 +318,29 @@ def plan_file(path: str, existing: dict, side: dict, zones: Zones) -> dict:
         if name_source == "whatsapp-name" and source == "whatsapp-name":
             notes.append("date only; time set to 12:00")
 
-        if local is not None and writable:
-            stamp, off = fmt(local), offset_str(local)
-            if is_video:
-                for t in ("QuickTime:CreateDate", "QuickTime:ModifyDate", "QuickTime:TrackCreateDate", "QuickTime:MediaCreateDate"):
-                    add(t, stamp + off, [f"-{t}=0000:00:00 00:00:00"])
-                if not existing.get("QuickTime:CreationDate"):
-                    add("Keys:CreationDate", stamp + off)
-            else:
-                if ext in EXIF_TYPES:
-                    add("EXIF:DateTimeOriginal", stamp)
-                    if not existing.get("EXIF:CreateDate"):
-                        add("EXIF:CreateDate", stamp)
-                    if not existing.get("EXIF:OffsetTimeOriginal"):
-                        add("EXIF:OffsetTimeOriginal", off)
-                if ext in XMP_DATE_TYPES:
-                    add("XMP-exif:DateTimeOriginal", stamp + off)
+    def undo_to(tag: str, old_key: str, empty: str = "") -> list[str]:
+        old = existing.get(old_key)
+        return [f"-{tag}={old}"] if forced and old else [f"-{tag}={empty}"]
+
+    if local is not None and writable and (source != "existing" or fill_video_dates or forced):
+        stamp, off = fmt(local), offset_str(local)
+        if is_video:
+            keep_modify = parse_video_date(existing.get("QuickTime:ModifyDate"), zone) is not None
+            for t in ("QuickTime:CreateDate", "QuickTime:ModifyDate", "QuickTime:TrackCreateDate", "QuickTime:MediaCreateDate"):
+                if t == "QuickTime:ModifyDate" and keep_modify and not forced:
+                    continue  # a real ModifyDate (e.g. when the clip was edited) is left as it is
+                add(t, stamp + off, undo_to(t, t, "0000:00:00 00:00:00") if t == "QuickTime:CreateDate" else [f"-{t}=0000:00:00 00:00:00"])
+            if forced or not existing.get("QuickTime:CreationDate"):
+                add("Keys:CreationDate", stamp + off, undo_to("Keys:CreationDate", "QuickTime:CreationDate"))
+        else:
+            if ext in EXIF_TYPES:
+                add("EXIF:DateTimeOriginal", stamp, undo_to("EXIF:DateTimeOriginal", "EXIF:DateTimeOriginal"))
+                if forced or not existing.get("EXIF:CreateDate"):
+                    add("EXIF:CreateDate", stamp, undo_to("EXIF:CreateDate", "EXIF:CreateDate"))
+                if forced or not existing.get("EXIF:OffsetTimeOriginal"):
+                    add("EXIF:OffsetTimeOriginal", off, undo_to("EXIF:OffsetTimeOriginal", "EXIF:OffsetTimeOriginal"))
+            if ext in XMP_DATE_TYPES:
+                add("XMP-exif:DateTimeOriginal", stamp + off, undo_to("XMP-exif:DateTimeOriginal", "XMP:DateTimeOriginal"))
 
     # --- GPS (only when the file has none)
     if writable and not file_has_gps and side["lat"] is not None:
@@ -340,7 +382,7 @@ def plan_file(path: str, existing: dict, side: dict, zones: Zones) -> dict:
 
 
 def build_plan(source: str, exe: str, default_tz: str, limit: int = 0, workers: int = 4,
-               only: list[str] | None = None) -> list[dict]:
+               only: list[str] | None = None, force_name_date: bool = False) -> list[dict]:
     media = core.scan_library(source, MEDIA)
     if only:
         wanted = {os.path.normcase(os.path.abspath(p)) for p in only}
@@ -379,7 +421,7 @@ def build_plan(source: str, exe: str, default_tz: str, limit: int = 0, workers: 
     plan = []
     for m in media:
         ex_row = existing.get(os.path.normcase(os.path.abspath(m.path)), {})
-        plan.append(plan_file(m.path, ex_row, read_sidecar_details(m.sidecars), zones))
+        plan.append(plan_file(m.path, ex_row, read_sidecar_details(m.sidecars), zones, force_name_date))
     return plan
 
 
@@ -448,10 +490,13 @@ def rewrite(et: ExifTool, path: str, args: list[str], expect: list[list[str]], w
         after = read_check(et, tmp)
         if before and after.get("File:ImageDataHash") != before:
             return "picture/video data fingerprint changed - not replaced"
-        for tag, _, _ in expect:
+        for tag, value, _ in expect:
             key = VERIFY.get(tag)
             if key and str(after.get(key, "0000")).startswith("0000"):
                 return f"{tag} did not read back - not replaced"
+            list_key = LIST_VERIFY.get(tag)
+            if list_key and value not in as_list(after.get(list_key)):
+                return f"{tag} {value!r} did not read back - not replaced"
         os.replace(tmp, path)
         tmp = ""
         return ""
@@ -483,6 +528,10 @@ def apply(plan: list[dict], exe: str, log_path: str, workers: int, ignore_minor:
                     tools[tid] = ExifTool(exe)
             et = tools[tid]
             args = tag_args(p["tags"]) + file_date_args(p["file_dates"])
+            if p.get("keep_dates"):
+                # Rewriting creates a new file; carry the current Windows dates over unchanged.
+                args += [f"-FileModifyDate={p['old_modify']}"] if p["old_modify"] else []
+                args += [f"-FileCreateDate={p['old_create']}"] if p["old_create"] else []
             try:
                 # Only file dates to set: done in place; the file content is not rewritten.
                 error = rewrite(et, p["path"], args, p["tags"], p["writable"] and bool(p["tags"]), ignore_minor, repair)
@@ -545,11 +594,52 @@ def undo(log_path: str, exe: str, workers: int) -> tuple[int, int]:
     return counts["ok"], counts["failed"]
 
 
+def build_keyword_plan(keyword_map: dict[str, list[str]], exe: str) -> list[dict]:
+    """Plan rows that add keywords (XMP dc:Subject) to files, e.g. album names.
+
+    keyword_map: {file path: [keyword or "person:Name", ...]}. Values already present are skipped;
+    files ExifTool cannot write (AVI/BMP) are left out. Windows dates are kept.
+    """
+    paths = [p for p in keyword_map if os.path.splitext(p)[1].lower() not in NOT_WRITABLE and os.path.exists(p)]
+    et = ExifTool(exe)
+    existing = {}
+    try:
+        for i in range(0, len(paths), 100):
+            for r in et.read_json(paths[i:i + 100], READ_TAGS):
+                existing[os.path.normcase(os.path.abspath(r["SourceFile"]))] = r
+    finally:
+        et.close()
+
+    plan = []
+    for p in paths:
+        ex = existing.get(os.path.normcase(os.path.abspath(p)), {})
+        have = set(as_list(ex.get("XMP:Subject")))
+        have_people = set(as_list(ex.get("XMP:PersonInImage")))
+        tags = []
+        for item in keyword_map[p]:
+            # "person:Name" adds a tagged person (PersonInImage) as well as the keyword.
+            k = item[len("person:"):] if item.startswith("person:") else item
+            if item.startswith("person:") and k not in have_people:
+                tags.append(["XMP-iptcExt:PersonInImage+", k, [f"-XMP-iptcExt:PersonInImage-={k}"]])
+            if k not in have:
+                tags.append(["XMP-dc:Subject+", k, [f"-XMP-dc:Subject-={k}"]])
+        if not tags:
+            continue
+        plan.append({"path": p, "type": os.path.splitext(p)[1].lstrip("."), "writable": True,
+                     "date_source": "", "date_taken": "", "timezone": "", "tags": tags, "file_dates": "",
+                     "keep_dates": True, "old_modify": ex.get("File:FileModifyDate", ""),
+                     "old_create": ex.get("File:FileCreateDate", ""), "notes": ""})
+    return plan
+
+
 # ----------------------------------------------------------------------------- CLI
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["plan", "apply", "undo"])
+    ap.add_argument("command", choices=["plan", "apply", "undo", "keywords"],
+                    help="keywords: add keywords from --map (plan only unless --apply)")
+    ap.add_argument("--map", help="keywords: JSON file {file path: [keyword, ...]}")
+    ap.add_argument("--apply", action="store_true", help="keywords: write them (needs --expected)")
     ap.add_argument("--source", default=r"C:\Media\Imports")
     ap.add_argument("--report-root", default=r"C:\Media\DedupeReports")
     ap.add_argument("--default-tz", default="Asia/Hong_Kong", help="timezone for files without GPS (default Asia/Hong_Kong)")
@@ -559,6 +649,8 @@ def main(argv=None) -> int:
     ap.add_argument("--only", action="append", default=[], help="only this file (repeatable)")
     ap.add_argument("--ignore-minor-errors", action="store_true",
                     help="let ExifTool write despite minor problems in a file's existing metadata (-m)")
+    ap.add_argument("--force-name-date", action="store_true",
+                    help="replace the date with the one in a camera-style file name (use with --only)")
     ap.add_argument("--repair-metadata", action="store_true",
                     help="rebuild damaged metadata from its readable tags before adding (use with --only)")
     ap.add_argument("--workers", type=int, default=4)
@@ -569,6 +661,25 @@ def main(argv=None) -> int:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     os.makedirs(args.report_root, exist_ok=True)
 
+    if args.command == "keywords":
+        if not args.map:
+            ap.error("keywords needs --map")
+        with open(args.map, encoding="utf-8") as f:
+            plan = build_keyword_plan(json.load(f), exe)
+        added = sum(len(p["tags"]) for p in plan)
+        print(f"Keywords: {added:,} to add across {len(plan):,} files.")
+        if not args.apply:
+            print("Plan only - nothing was changed.")
+            return 0
+        if args.expected != len(plan):
+            print(f"The plan has {len(plan):,} files to change, not --expected {args.expected:,}. Nothing was changed.")
+            return 2
+        log_path = os.path.join(args.report_root, f"EmbedLog_{stamp}_keywords.csv")
+        print(f"Writing keywords to {len(plan):,} files. Undo record: {log_path}")
+        ok, failed = apply(plan, exe, log_path, args.workers)
+        print(f"Done: {ok:,} files updated, {failed:,} failed (failed files were left unchanged).")
+        return 1 if failed else 0
+
     if args.command == "undo":
         if not args.log:
             ap.error("undo needs --log")
@@ -577,7 +688,9 @@ def main(argv=None) -> int:
         return 1 if failed else 0
 
     source = os.path.realpath(args.source)
-    plan = build_plan(source, exe, args.default_tz, args.limit, args.workers, args.only)
+    if args.force_name_date and not args.only:
+        ap.error("--force-name-date replaces existing dates; name the files with --only")
+    plan = build_plan(source, exe, args.default_tz, args.limit, args.workers, args.only, args.force_name_date)
     plan_csv = os.path.join(args.report_root, f"EmbedPlan_{stamp}.csv")
     write_plan_csv(plan, plan_csv)
 
