@@ -278,5 +278,35 @@ class EndToEndTests(Fixture):
             triage.main(["--source", self.tmp, "--cache", self.cache, "--report-root", self.reports, "--no-clip"])
 
 
+class SimilarTests(Fixture):
+    def test_rotated_and_recompressed_found_burst_not(self):
+        import find_similar
+        lib = os.path.join(self.tmp, "Library")
+        base = picture(40, (1200, 900))
+        save(base, os.path.join(lib, "2019", "a.jpg"), quality=92)
+        save(base.rotate(90, expand=True), os.path.join(lib, "2019", "a (2).jpg"), quality=92)   # rotated copy
+        save(base.resize((600, 450)), os.path.join(lib, "2020", "wa.jpg"), quality=50)          # recompressed copy
+        burst = base.copy()
+        ImageDraw.Draw(burst).ellipse([300, 200, 700, 600], fill=(250, 250, 250))             # same scene, something moved
+        save(burst, os.path.join(lib, "2019", "burst.jpg"), quality=92)
+        save(picture(41, (1200, 900)), os.path.join(lib, "2019", "other.jpg"), quality=92)
+
+        self.assertEqual(find_similar.main(["--source", lib, "--report-root", self.reports]), 0)
+        out = glob_one(os.path.join(self.reports, "Similar_*", "Similar_*.csv"))
+        with open(out, encoding="utf-8-sig") as f:
+            pairs = {frozenset(os.path.basename(p) for p in (r["a"], r["b"])): r for r in csv.DictReader(f)}
+        self.assertIn(frozenset({"a.jpg", "a (2).jpg"}), pairs)
+        self.assertNotEqual(pairs[frozenset({"a.jpg", "a (2).jpg"})]["rotation"], "0")
+        self.assertIn(frozenset({"a.jpg", "wa.jpg"}), pairs)
+        self.assertFalse(any("burst.jpg" in k or "other.jpg" in k for k in pairs), "burst/other not reported")
+
+
+def glob_one(pattern):
+    import glob
+    found = glob.glob(pattern)
+    assert len(found) == 1, found
+    return found[0]
+
+
 if __name__ == "__main__":
     unittest.main()
