@@ -152,8 +152,12 @@ def main(argv=None) -> int:
         a_dims, b_dims = "x".join(map(str, info[i][0])), "x".join(map(str, info[j][0]))
         worst = worst_patch(a, b, rot)
         kind = classify(worst, a_dims, b_dims, rot)
-        # Copies: keep more pixels, then the larger file. Separate shots: keep both by default.
+        # Copies: keep more pixels, then the larger file - but at about the same resolution
+        # prefer a copy in an album folder, so the album stays complete. Separate shots: keep both.
+        in_album = lambda p: f"{os.sep}Albums{os.sep}" in p  # noqa: E731
         keep = ("B" if (pb, sb) > (pa, sa) else "A") if kind == "copy" else "both"
+        if kind == "copy" and in_album(a) != in_album(b) and 0.95 <= pa / max(pb, 1) <= 1.05:
+            keep = "A" if in_album(a) else "B"
         rows.append({"a": a, "b": b, "ka": keys[i], "kb": keys[j], "rotation": rot, "pixel_diff": round(diff, 2),
                      "worst_patch": round(worst, 2), "kind": kind,
                      "a_size": sa, "b_size": sb, "a_dims": a_dims, "b_dims": b_dims, "suggest": keep})
