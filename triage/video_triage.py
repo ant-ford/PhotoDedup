@@ -85,6 +85,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-duration-diff", type=float, default=0.5)
     ap.add_argument("--max-distance", type=int, default=8)
     ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--suggest-junk", action="store_true",
+                    help="also suggest removing videos the model rates as junk (off: only near-copies are suggested)")
     args = ap.parse_args(argv)
 
     new = sorted(os.path.join(d, f) for d, _, fs in os.walk(args.source) for f in fs if VIDEO.search(f) and os.path.getsize(os.path.join(d, f)))
@@ -196,6 +198,10 @@ def main(argv=None) -> int:
             category, conf = ranked[0]
             top = ", ".join(f"{a} {b:.0%}" for a, b in ranked[:3])
             suggestion, note = core.decide(category, conf, [], args.threshold, probs.get("photo", 0.0))
+            if suggestion == "reject" and not args.suggest_junk:
+                # On compressed video frames the model calls many family clips "meme" or
+                # "screenshot", so content alone only flags for review unless asked.
+                suggestion, note = "review", "possible " + category + " - check"
         else:
             category, conf, suggestion, note, top = "unknown", 0.0, "keep", "", ""
         q = copy_of.get(p, "")
