@@ -301,6 +301,36 @@ class SimilarTests(Fixture):
         self.assertFalse(any("burst.jpg" in k or "other.jpg" in k for k in pairs), "burst/other not reported")
 
 
+class VideoTests(Fixture):
+    def test_reencoded_copy_found_different_clip_not(self):
+        import subprocess
+        import clipmodel
+        import video_triage
+        ffmpeg = video_triage.ffmpeg_exe()
+        src = os.path.join(self.tmp, "Imports")
+        lib = os.path.join(self.tmp, "Library")
+        os.makedirs(lib)
+        a, b, c = (os.path.join(src, n) for n in ("VID-20240101-WA0001.mp4", "VID-20240102-WA0007.mp4", "VID-20240103-WA0002.mp4"))
+        run = lambda *x: subprocess.run([ffmpeg, "-v", "error", "-y", *x], check=True)  # noqa: E731
+        run("-f", "lavfi", "-i", "testsrc=duration=4:size=640x360:rate=25", "-pix_fmt", "yuv420p", "-b:v", "3M", a)
+        run("-i", a, "-vf", "scale=320:180", "-b:v", "60k", b)                               # forwarded, re-compressed (smaller)
+        run("-f", "lavfi", "-i", "mandelbrot=size=640x360:rate=25", "-t", "4", "-pix_fmt", "yuv420p", c)
+        real = clipmodel.ClipClassifier
+        clipmodel.ClipClassifier = lambda *a, **k: FakeClassifier()
+        try:
+            self.assertEqual(video_triage.main(["--source", src, "--library", lib, "--report-root", self.reports,
+                                                "--cache", self.cache, "--workers", "2"]), 0)
+        finally:
+            clipmodel.ClipClassifier = real
+        out = glob_one(os.path.join(self.reports, "VideoTriage_*", "VideoTriage_*.csv"))
+        with open(out, encoding="utf-8-sig") as f:
+            rows = {os.path.basename(r["p"]): r for r in csv.DictReader(f)}
+        self.assertEqual(rows["VID-20240102-WA0007.mp4"]["c"], "video_copy")
+        self.assertTrue(rows["VID-20240102-WA0007.mp4"]["o"].endswith("VID-20240101-WA0001.mp4"), "larger copy kept")
+        self.assertNotEqual(rows["VID-20240103-WA0002.mp4"]["c"], "video_copy")
+        self.assertNotEqual(rows["VID-20240101-WA0001.mp4"]["c"], "video_copy")
+
+
 def glob_one(pattern):
     import glob
     found = glob.glob(pattern)

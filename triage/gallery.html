@@ -101,16 +101,17 @@
 
   const LABELS = {
     screenshot: 'Screenshots', meme: 'Memes', advert: 'Adverts', greeting: 'Greetings & quotes',
-    news: 'News graphics', whatsapp_copy: 'WhatsApp copies', document: 'Documents', photo: 'Photos',
+    news: 'News graphics', whatsapp_copy: 'WhatsApp copies', video_copy: 'Copies of other videos', document: 'Documents', photo: 'Photos',
     unreadable: 'Unreadable', unknown: 'Unclassified'
   };
   const HINTS = {
     whatsapp_copy: 'Left: the WhatsApp copy. Right: the photo you already have. Marked copies are removed; your photo is always kept.',
+    video_copy: 'Left: this video (start, middle, end). Right: the copy that is kept - in your library, or a larger copy. Marked copies are removed; the kept copy stays.',
     photo: 'Classified as personal photos. Nothing here is suggested for removal; skim for anything that slipped through.',
     document: 'Documents, receipts and tickets are kept by default because some may matter.',
     unreadable: 'These files could not be opened. They are kept; check them by hand.',
   };
-  const ORDER = ['screenshot', 'meme', 'advert', 'greeting', 'news', 'whatsapp_copy', 'document', 'photo', 'unreadable', 'unknown'];
+  const ORDER = ['screenshot', 'meme', 'advert', 'greeting', 'news', 'whatsapp_copy', 'video_copy', 'document', 'photo', 'unreadable', 'unknown'];
   const CHUNK = 240;
   const storeKey = 'triage-decisions-' + D.stamp;
 
@@ -162,7 +163,7 @@
   function card(r) {
     const d = decision(r);
     const badge = d === 'reject' ? 'Remove' : (r.s === 'review' ? 'Review' : 'Keep');
-    const pics = r.c === 'whatsapp_copy'
+    const pics = r.oid
       ? `<figure><img loading="lazy" src="${thumb(r.id)}" alt=""><figcaption>WhatsApp ${r.w}×${r.h}</figcaption></figure>
          <figure><img loading="lazy" src="${thumb(r.oid)}" alt=""><figcaption>Yours ${r.ow}×${r.oh}</figcaption></figure>`
       : `<figure><img loading="lazy" src="${thumb(r.id)}" alt=""></figure>`;
@@ -196,7 +197,7 @@
     summary();
     $('hint').textContent = (HINTS[current] || 'Sorted by confidence, highest first. Click a picture to toggle keep/remove.') +
       ` ${shown.length.toLocaleString()} shown.`;
-    $('grid').className = 'grid' + (current === 'whatsapp_copy' ? ' pairs' : '');
+    $('grid').className = 'grid' + (current === 'whatsapp_copy' || current === 'video_copy' ? ' pairs' : '');
     $('grid').innerHTML = shown.length ? '' : '<p class="empty">Nothing to show with these filters.</p>';
     rendered = 0;
     more();

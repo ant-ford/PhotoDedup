@@ -7,3 +7,5 @@ numpy>=1.26
 # embed/embed_metadata.py (shares this environment)
 timezonefinder>=6.5
 tzdata
+# triage/video_triage.py: frame grabbing (bundles its own ffmpeg)
+imageio-ffmpeg>=0.5
