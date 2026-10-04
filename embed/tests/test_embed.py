@@ -1,0 +1,180 @@
+"""Tests for embed_metadata.py against real ExifTool on a temporary fixture.
+
+    python -m unittest discover -s embed/tests -v
+Needs ExifTool, Pillow, pillow-heif and timezonefinder (the triage .venv has them).
+"""
+
+import csv
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from PIL import Image
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HERE)
+import embed_metadata as em  # noqa: E402
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF = True
+except ImportError:
+    HEIF = False
+
+EXE = em.find_exiftool()
+GP = os.path.join("partA", "Takeout", "Google Photos", "Photos from 2018")
+SAMPLE_VIDEO = next(iter(sorted(glob.glob(r"C:\Media\Imports\**\*.mp4", recursive=True),
+                                key=os.path.getsize)), None)
+
+
+def read(path, *tags):
+    out = subprocess.run([EXE, "-j", "-G0", "-n", "-api", "QuickTimeUTC=1", "-api", "ImageHashType=SHA256", *tags, path],
+                         capture_output=True, text=True, encoding="utf-8").stdout
+    return json.loads(out)[0]
+
+
+def sidecar(path, **fields):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"title": os.path.basename(path), **fields}, f)
+
+
+class EmbedTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="embed_test_"))
+        self.src = os.path.join(self.tmp, "Imports")
+        self.rep = os.path.join(self.tmp, "Reports")
+        os.makedirs(os.path.join(self.src, GP))
+        os.makedirs(os.path.join(self.src, "WhatsApp-001"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def p(self, *parts):
+        return os.path.join(self.src, *parts)
+
+    def build(self):
+        img = Image.new("RGB", (64, 48), (200, 120, 40))
+        # 1. No EXIF date; sidecar has UTC time, GPS in Hong Kong, description and people.
+        img.save(self.p(GP, "plain.jpg"), quality=90)
+        sidecar(self.p(GP, "plain.jpg.supplemental-metadata.json"),
+                photoTakenTime={"timestamp": "1530860833"},  # 2018-07-06 07:07:13 UTC
+                geoData={"latitude": 22.271106, "longitude": 114.130844, "altitude": 182.2},
+                description="Beach day", people=[{"name": "Adam"}, {"name": "Liam"}])
+        # 2. Camera date already present: must not change; sidecar time differs.
+        ex = Image.Exif()
+        ex[0x8769] = {0x9003: "2018:07:06 09:00:00"}
+        img.save(self.p(GP, "camera.jpg"), exif=ex, quality=90)
+        sidecar(self.p(GP, "camera.jpg.supplemental-metadata.json"), photoTakenTime={"timestamp": "1530860833"})
+        # 3. WhatsApp image with no sidecar: date from name, 12:00, Hong Kong.
+        img.save(self.p("WhatsApp-001", "IMG-20230505-WA0013.jpg"), quality=70)
+        # 4. PNG with sidecar.
+        img.save(self.p(GP, "graphic.png"))
+        sidecar(self.p(GP, "graphic.png.supplemental-metadata.json"), photoTakenTime={"timestamp": "1530860833"})
+        # 5. BMP: not writable, file dates only.
+        img.save(self.p(GP, "old.bmp"))
+        sidecar(self.p(GP, "old.bmp.supplemental-metadata.json"), photoTakenTime={"timestamp": "1530860833"})
+        # 6. Sidecar date (upload time) far from a WhatsApp name date: name wins.
+        img.save(self.p(GP, "IMG-20170101-WA0001.jpg"), quality=70)
+        sidecar(self.p(GP, "IMG-20170101-WA0001.jpg.supplemental-metadata.json"), photoTakenTime={"timestamp": "1700000000"})
+        # 7. Sidecar date EARLIER than the WhatsApp name (forwarded old photo): sidecar wins.
+        img.save(self.p(GP, "IMG-20190101-WA0002.jpg"), quality=70)
+        sidecar(self.p(GP, "IMG-20190101-WA0002.jpg.supplemental-metadata.json"), photoTakenTime={"timestamp": "1530860833"})
+        if HEIF:
+            img.save(self.p(GP, "phone.heic"))
+            sidecar(self.p(GP, "phone.heic.supplemental-metadata.json"), photoTakenTime={"timestamp": "1530860833"})
+
+    def run_cmd(self, *args):
+        return em.main([*args, "--source", self.src, "--report-root", self.rep, "--workers", "2"])
+
+    def latest(self, pattern):
+        return sorted(glob.glob(os.path.join(self.rep, pattern)))[-1]
+
+    def test_plan_changes_nothing(self):
+        self.build()
+        before = {f: os.path.getmtime(f) for f in glob.glob(self.p("**", "*.*"), recursive=True)}
+        self.assertEqual(self.run_cmd("plan"), 0)
+        after = {f: os.path.getmtime(f) for f in before}
+        self.assertEqual(before, after)
+        with open(self.latest("EmbedPlan_*.csv"), encoding="utf-8-sig") as f:
+            rows = {os.path.basename(r["Path"]): r for r in csv.DictReader(f)}
+        self.assertEqual(rows["plain.jpg"]["DateSource"], "sidecar")
+        self.assertEqual(rows["plain.jpg"]["DateTaken"], "2018:07:06 15:07:13+08:00")
+        self.assertEqual(rows["camera.jpg"]["DateSource"], "existing")
+        self.assertNotIn("DateTimeOriginal", rows["camera.jpg"]["TagsToAdd"])
+        self.assertEqual(rows["IMG-20230505-WA0013.jpg"]["DateTaken"], "2023:05:05 12:00:00+08:00")
+        self.assertEqual(rows["IMG-20170101-WA0001.jpg"]["DateSource"], "whatsapp-name", "later sidecar = upload date")
+        self.assertEqual(rows["IMG-20190101-WA0002.jpg"]["DateSource"], "sidecar", "earlier sidecar = real date")
+
+    def test_apply_verify_and_undo(self):
+        self.build()
+        files = [f for f in glob.glob(self.p("**", "*.*"), recursive=True) if not f.endswith(".json")]
+        hashes = {f: read(f, "-ImageDataHash").get("File:ImageDataHash") for f in files}
+        pixels = {f: Image.open(f).tobytes() for f in files}
+
+        self.assertEqual(self.run_cmd("apply", "--expected", "999"), 2, "count mismatch refuses")
+        self.assertFalse(glob.glob(os.path.join(self.rep, "EmbedLog_*.csv")))
+
+        self.run_cmd("plan")
+        with open(self.latest("EmbedPlan_*.csv"), encoding="utf-8-sig") as f:
+            n = sum(1 for r in csv.DictReader(f) if r["TagsToAdd"] or r["FileDates"])
+        self.assertEqual(self.run_cmd("apply", "--expected", str(n)), 0)
+
+        plain = read(self.p(GP, "plain.jpg"))
+        self.assertEqual(plain["EXIF:DateTimeOriginal"], "2018:07:06 15:07:13")
+        self.assertEqual(plain["EXIF:OffsetTimeOriginal"], "+08:00")
+        self.assertAlmostEqual(plain["EXIF:GPSLatitude"], 22.271106, places=5)
+        self.assertAlmostEqual(plain["EXIF:GPSLongitude"], 114.130844, places=5)
+        self.assertEqual(plain["XMP:Description"], "Beach day")
+        self.assertEqual(plain["XMP:PersonInImage"], ["Adam", "Liam"])
+        self.assertTrue(str(plain["File:FileModifyDate"]).startswith("2018:07:06 15:07:13"))
+
+        self.assertEqual(read(self.p(GP, "camera.jpg"))["EXIF:DateTimeOriginal"], "2018:07:06 09:00:00", "existing date kept")
+        self.assertEqual(read(self.p("WhatsApp-001", "IMG-20230505-WA0013.jpg"))["EXIF:DateTimeOriginal"], "2023:05:05 12:00:00")
+        self.assertEqual(read(self.p(GP, "graphic.png"))["XMP:DateTimeOriginal"], "2018:07:06 15:07:13+08:00")
+        self.assertTrue(str(read(self.p(GP, "old.bmp"))["File:FileModifyDate"]).startswith("2018:07:06"))
+        if HEIF:
+            self.assertEqual(read(self.p(GP, "phone.heic"))["EXIF:DateTimeOriginal"], "2018:07:06 15:07:13")
+
+        for f in files:
+            self.assertEqual(read(f, "-ImageDataHash").get("File:ImageDataHash"), hashes[f], f"image data unchanged: {f}")
+            self.assertEqual(Image.open(f).tobytes(), pixels[f], f"pixels unchanged: {f}")
+        self.assertFalse(glob.glob(self.p("**", ".embed-*"), recursive=True), "no temporary files left")
+
+        self.assertEqual(em.main(["undo", "--log", self.latest("EmbedLog_*.csv"), "--workers", "2"]), 0)
+        plain = read(self.p(GP, "plain.jpg"))
+        for tag in ("EXIF:DateTimeOriginal", "EXIF:GPSLatitude", "XMP:Description", "XMP:PersonInImage"):
+            self.assertNotIn(tag, plain, f"undo removed {tag}")
+        self.assertEqual(read(self.p(GP, "camera.jpg"))["EXIF:DateTimeOriginal"], "2018:07:06 09:00:00")
+        for f in files:
+            self.assertEqual(Image.open(f).tobytes(), pixels[f])
+
+    @unittest.skipUnless(SAMPLE_VIDEO, "no MP4 in Imports to copy")
+    def test_video(self):
+        dest = self.p(GP, "clip.mp4")
+        shutil.copyfile(SAMPLE_VIDEO, dest)
+        # Clear its date in the copy so there is something to fill.
+        subprocess.run([EXE, "-overwrite_original", "-QuickTime:CreateDate=0000:00:00 00:00:00",
+                        "-Keys:CreationDate=", "-GPSCoordinates=", dest], capture_output=True)
+        sidecar(dest + ".supplemental-metadata.json", photoTakenTime={"timestamp": "1530860833"},
+                geoData={"latitude": 51.5, "longitude": -0.12, "altitude": 10})
+        h0 = read(dest, "-ImageDataHash")["File:ImageDataHash"]
+        self.run_cmd("plan")
+        with open(self.latest("EmbedPlan_*.csv"), encoding="utf-8-sig") as f:
+            row = next(r for r in csv.DictReader(f) if r["Path"].endswith("clip.mp4"))
+        self.assertEqual(row["Timezone"], "Europe/London", "timezone from GPS")
+        self.assertEqual(row["DateTaken"], "2018:07:06 08:07:13+01:00")
+        self.assertEqual(self.run_cmd("apply", "--expected", "1"), 0)
+        v = read(dest, "-QuickTime:CreateDate", "-GPSCoordinates", "-ImageDataHash")
+        self.assertEqual(v["File:ImageDataHash"], h0)
+        self.assertTrue(str(v["QuickTime:CreateDate"]).startswith("2018:07:06"))
+        self.assertIn("51.5", str(v.get("QuickTime:GPSCoordinates")))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -53,8 +53,8 @@ def sidecar_names(media_name: str) -> list[str]:
     return names
 
 
-def scan_library(source_root: str) -> list[ImageFile]:
-    """All images under source_root (Trash/Bin excluded), each with its sidecar paths."""
+def scan_library(source_root: str, extensions: set[str] = IMAGE_EXTENSIONS) -> list[ImageFile]:
+    """All media with these extensions under source_root (Trash/Bin excluded), each with its sidecar paths."""
     # realpath expands 8.3 short names (C:\Users\ABC~1) so paths match PowerShell's.
     source_root = os.path.realpath(source_root)
     images: list[ImageFile] = []
@@ -72,7 +72,7 @@ def scan_library(source_root: str) -> list[ImageFile]:
             if SIDECAR_RE.search(name):
                 sidecars_full.add(full.lower())
                 sidecars_by_part.setdefault(part_relative(rel).lower(), []).append(full)
-            elif os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+            elif os.path.splitext(name)[1].lower() in extensions:
                 st = os.stat(full)
                 if st.st_size > 0:
                     images.append(ImageFile(full, rel, st.st_size, st.st_mtime_ns))

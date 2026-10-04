@@ -4,3 +4,6 @@ open_clip_torch>=2.24
 pillow>=10.0
 pillow-heif>=0.16
 numpy>=1.26
+# embed/embed_metadata.py (shares this environment)
+timezonefinder>=6.5
+tzdata
